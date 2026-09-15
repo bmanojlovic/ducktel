@@ -43,6 +43,11 @@ func Open(dataDir string) (*Engine, error) {
 	return e, nil
 }
 
+// CreateViews (re)derives the signal views from the Parquet files currently on
+// disk. DuckDB resolves a read_parquet glob when the view is created, so views
+// must be re-derived to observe files written afterwards. See refresh in Query:
+// without it an engine opened before any data existed kept a placeholder
+// `WHERE false` view and returned zero rows forever.
 func (e *Engine) CreateViews() error {
 	views := []struct {
 		name      string
@@ -106,6 +111,12 @@ func (e *Engine) CreateViews() error {
 // sent to DuckDB as placeholders (?) rather than interpolated into the SQL
 // string, which prevents SQL injection from caller-supplied values.
 func (e *Engine) Query(sqlStr string, args ...interface{}) ([]map[string]interface{}, []string, error) {
+	// Re-derive the views so the query sees Parquet files written since the
+	// engine was opened. Cheap: DuckDB resolves the glob at view creation.
+	if err := e.CreateViews(); err != nil {
+		return nil, nil, fmt.Errorf("refreshing views: %w", err)
+	}
+
 	rows, err := e.db.Query(sqlStr, args...)
 	if err != nil {
 		return nil, nil, fmt.Errorf("executing query: %w", err)
@@ -152,6 +163,9 @@ func (e *Engine) Query(sqlStr string, args ...interface{}) ([]map[string]interfa
 func (e *Engine) Describe(view string) ([]ColumnInfo, error) {
 	if !validView(view) {
 		return nil, fmt.Errorf("unknown view %q (expected traces, logs, or metrics)", view)
+	}
+	if err := e.CreateViews(); err != nil {
+		return nil, fmt.Errorf("refreshing views: %w", err)
 	}
 	rows, err := e.db.Query(fmt.Sprintf("DESCRIBE %s", view))
 	if err != nil {
