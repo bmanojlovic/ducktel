@@ -33,25 +33,29 @@ func tracesCmd() *cobra.Command {
 			q := "SELECT trace_id, span_id, service_name, span_name, span_kind, duration_ms, status_code FROM traces"
 
 			var conditions []string
+			var params []interface{}
 			if service != "" {
-				conditions = append(conditions, fmt.Sprintf("service_name = '%s'", service))
+				conditions = append(conditions, "service_name = ?")
+				params = append(params, service)
 			}
 			if since > 0 {
 				cutoff := time.Now().Add(-since).UnixMicro()
-				conditions = append(conditions, fmt.Sprintf("start_time >= %d", cutoff))
+				conditions = append(conditions, "start_time >= ?")
+				params = append(params, cutoff)
 			}
 			if status != "" {
 				code := "STATUS_CODE_" + strings.ToUpper(status)
-				conditions = append(conditions, fmt.Sprintf("status_code = '%s'", code))
+				conditions = append(conditions, "status_code = ?")
+				params = append(params, code)
 			}
 
 			if len(conditions) > 0 {
 				q += " WHERE " + strings.Join(conditions, " AND ")
 			}
 			q += " ORDER BY start_time DESC"
-			q += fmt.Sprintf(" LIMIT %d", limit)
+			q += fmt.Sprintf(" LIMIT %d", clampLimit(limit))
 
-			results, columns, err := engine.Query(q)
+			results, columns, err := engine.Query(q, params...)
 			if err != nil {
 				return fmt.Errorf("querying traces: %w", err)
 			}
