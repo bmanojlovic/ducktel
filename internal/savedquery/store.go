@@ -23,14 +23,14 @@ type Query struct {
 
 // RunResult captures the output of running a saved query.
 type RunResult struct {
-	Name      string                   `json:"name"`
-	SQL       string                   `json:"sql"`
-	RanAt     time.Time                `json:"ran_at"`
-	RowCount  int                      `json:"row_count"`
-	Columns   []string                 `json:"columns,omitempty"`
-	Results   []map[string]interface{} `json:"results"`
-	Error     string                   `json:"error,omitempty"`
-	DurationMs float64                 `json:"duration_ms"`
+	Name       string                   `json:"name"`
+	SQL        string                   `json:"sql"`
+	RanAt      time.Time                `json:"ran_at"`
+	RowCount   int                      `json:"row_count"`
+	Columns    []string                 `json:"columns,omitempty"`
+	Results    []map[string]interface{} `json:"results"`
+	Error      string                   `json:"error,omitempty"`
+	DurationMs float64                  `json:"duration_ms"`
 }
 
 // Store manages saved queries as a JSON file in the data directory.
