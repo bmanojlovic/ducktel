@@ -20,6 +20,7 @@ func serveCmd() *cobra.Command {
 		port          int
 		flushInterval time.Duration
 		token         string
+		flushToken    string
 	)
 
 	cmd := &cobra.Command{
@@ -42,6 +43,22 @@ token would cross an untrusted network.`,
 					token = v
 				}
 			}
+			// /flush is authorised by its own token, separate from the ingest
+			// token, so the query side can request a flush without holding
+			// write access.
+			if !cmd.Flags().Changed("flush-token") {
+				if v := os.Getenv("DUCKTEL_FLUSH_TOKEN"); v != "" {
+					flushToken = v
+				}
+			}
+			// Fall back to the MCP token: in the shipped deployment the query
+			// container holds only DUCKTEL_MCP_TOKEN, and this process is the
+			// one that must accept it.
+			if flushToken == "" {
+				if v := os.Getenv("DUCKTEL_MCP_TOKEN"); v != "" {
+					flushToken = v
+				}
+			}
 
 			w := writer.New(dataDir, flushInterval, 1000)
 			w.OnError(func(err error) {
@@ -58,7 +75,7 @@ token would cross an untrusted network.`,
 			log.Printf("starting: data-dir=%s flush-interval=%s auth=%s",
 				dataDir, flushInterval, authState)
 
-			r := receiver.New(host, port, w, token)
+			r := receiver.New(host, port, w, token, flushToken, w.Flush)
 
 			sigCh := make(chan os.Signal, 1)
 			// SIGHUP requests an immediate flush without shutting down, so
@@ -109,6 +126,7 @@ token would cross an untrusted network.`,
 	cmd.Flags().IntVar(&port, "port", 4318, "Port to listen on")
 	cmd.Flags().DurationVar(&flushInterval, "flush-interval", 30*time.Second, "How often to flush buffered spans to disk")
 	cmd.Flags().StringVar(&token, "auth-token", "", "Require this bearer token on OTLP endpoints (env: DUCKTEL_AUTH_TOKEN)")
+	cmd.Flags().StringVar(&flushToken, "flush-token", "", "Require this bearer token on POST /flush (env: DUCKTEL_FLUSH_TOKEN, or DUCKTEL_MCP_TOKEN)")
 
 	return cmd
 }
