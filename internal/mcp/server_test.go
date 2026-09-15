@@ -15,6 +15,10 @@ import (
 
 // --- helpers ---
 
+// seedSpan mirrors what the receiver actually stores: service.name and
+// tenant.id arrive as RESOURCE attributes (service.name is additionally
+// promoted to the service_name column), while the span's own attributes carry
+// only keys the instrumenting app set.
 func seedSpan(svc, tenant, traceID string, attrs string) writer.TraceSpan {
 	now := time.Now()
 	return writer.TraceSpan{
@@ -22,7 +26,7 @@ func seedSpan(svc, tenant, traceID string, attrs string) writer.TraceSpan {
 		ServiceName: svc, SpanName: "op", SpanKind: "SPAN_KIND_SERVER",
 		StartTime: now.UnixMicro(), EndTime: now.UnixMicro(), DurationMs: 5,
 		StatusCode: "STATUS_CODE_OK", Attributes: attrs,
-		ResourceAttributes: `{"tenant.id":"` + tenant + `"}`,
+		ResourceAttributes: `{"service.name":"` + svc + `","tenant.id":"` + tenant + `"}`,
 		Events:             "[]", Links: "[]",
 	}
 }
@@ -248,6 +252,36 @@ func TestSpanSearchDottedAttributeKey(t *testing.T) {
 	}
 }
 
+// TestSpanSearchFindsResourceAttributes guards a silent-zero-result trap:
+// service.name arrives as a RESOURCE attribute (and is promoted to the
+// service_name column) but is absent from span attributes, so a filter that
+// checks only `attributes` matches nothing for the most likely key a caller
+// would use.
+func TestSpanSearchFindsResourceAttributes(t *testing.T) {
+	s, _ := newTestServer(t)
+
+	body, isErr := call(t, s, "span_search", map[string]any{
+		"tenant":  "acme",
+		"filters": []map[string]any{{"key": "service.name", "value": "worker"}},
+	})
+	if isErr {
+		t.Fatalf("unexpected error: %s", body)
+	}
+	if n := countRows(t, body); n != 1 {
+		t.Errorf("filter on service.name matched %d rows, want 1 — resource attributes are not searched\n%s", n, body)
+	}
+
+	// And a key that lives in span attributes still works.
+	body, _ = call(t, s, "span_search", map[string]any{
+		"tenant":  "acme",
+		"filters": []map[string]any{{"key": "job", "value": "sync"}},
+	})
+	if n := countRows(t, body); n != 1 {
+		t.Errorf("filter on span attribute matched %d rows, want 1\n%s", n, body)
+	}
+}
+
+// TestSpanSearchMultipleFiltersAreAnded verifies filters combine with AND.
 func TestSpanSearchMultipleFiltersAreAnded(t *testing.T) {
 	s, _ := newTestServer(t)
 
