@@ -43,8 +43,10 @@ spec:
       containers:
         # --- write side: OTLP ingest ---
         - name: otlp
-          image: ghcr.io/bmanojlovic/ducktel:current
-          imagePullPolicy: Always
+          # Pinned to an immutable tag: a mutable tag let a pod start on a
+          # stale build (the earlier `unknown flag: --http` crashloop).
+          image: ghcr.io/bmanojlovic/ducktel:sha-1c6cc19
+          imagePullPolicy: IfNotPresent
           args:
             - serve
             - --host
@@ -103,8 +105,10 @@ spec:
               mountPath: /data
         # --- read side: MCP query tools ---
         - name: mcp
-          image: ghcr.io/bmanojlovic/ducktel:current
-          imagePullPolicy: Always
+          # Pinned to an immutable tag: a mutable tag let a pod start on a
+          # stale build (the earlier `unknown flag: --http` crashloop).
+          image: ghcr.io/bmanojlovic/ducktel:sha-1c6cc19
+          imagePullPolicy: IfNotPresent
           args:
             - mcp
             - --http
@@ -168,23 +172,19 @@ spec:
           persistentVolumeClaim:
             claimName: ducktel-data
 ---
-# Two independent bearer tokens. Generate with:
+# NOTE: the bearer tokens are deliberately NOT declared here. A Secret with
+# placeholder values in version control is a footgun: `kubectl apply -f` this
+# file and it overwrites the live credentials (this happened once). Create them
+# out of band, and let Terraform manage them instead:
+#
 #   kubectl create secret generic ducktel-tokens -n ducktel \
 #     --from-literal=otlp-token="$(openssl rand -hex 32)" \
 #     --from-literal=mcp-token="$(openssl rand -hex 32)"
 #
-# This manifest declares the Secret with placeholder values so a fresh cluster
-# has something to mount; replace them before relying on the deployment, since
-# the values below are in version control.
-apiVersion: v1
-kind: Secret
-metadata:
-  name: ducktel-tokens
-  namespace: ducktel
-type: Opaque
-stringData:
-  otlp-token: CHANGE-ME-otlp-write-token
-  mcp-token: CHANGE-ME-mcp-read-token
+# The two tokens are separate trust domains:
+#   otlp-token  authorises OTLP ingest   (held by senders)
+#   mcp-token   authorises MCP reads AND POST /flush
+#               (held by consumers; cannot write telemetry)
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim
