@@ -13,6 +13,17 @@ type ColumnInfo struct {
 	Type string
 }
 
+// views is the allowlist of queryable signal views.
+var views = map[string]bool{
+	"traces":  true,
+	"logs":    true,
+	"metrics": true,
+}
+
+func validView(name string) bool {
+	return views[name]
+}
+
 type Engine struct {
 	db      *sql.DB
 	dataDir string
@@ -91,8 +102,11 @@ func (e *Engine) CreateViews() error {
 	return nil
 }
 
-func (e *Engine) Query(sqlStr string) ([]map[string]interface{}, []string, error) {
-	rows, err := e.db.Query(sqlStr)
+// Query executes SQL with optional bound parameters. Values passed in args are
+// sent to DuckDB as placeholders (?) rather than interpolated into the SQL
+// string, which prevents SQL injection from caller-supplied values.
+func (e *Engine) Query(sqlStr string, args ...interface{}) ([]map[string]interface{}, []string, error) {
+	rows, err := e.db.Query(sqlStr, args...)
 	if err != nil {
 		return nil, nil, fmt.Errorf("executing query: %w", err)
 	}
@@ -133,7 +147,12 @@ func (e *Engine) Query(sqlStr string) ([]map[string]interface{}, []string, error
 	return results, columns, nil
 }
 
+// Describe returns column info for a known view. The view name is validated
+// against an allowlist because identifiers cannot be bound as parameters.
 func (e *Engine) Describe(view string) ([]ColumnInfo, error) {
+	if !validView(view) {
+		return nil, fmt.Errorf("unknown view %q (expected traces, logs, or metrics)", view)
+	}
 	rows, err := e.db.Query(fmt.Sprintf("DESCRIBE %s", view))
 	if err != nil {
 		return nil, fmt.Errorf("describing %s: %w", view, err)
