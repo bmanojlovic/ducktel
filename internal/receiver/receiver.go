@@ -51,25 +51,38 @@ type Receiver struct {
 	server   *http.Server
 	consumer Consumer
 	token    string
+	// flushToken authorises POST /flush, and is deliberately a DIFFERENT secret
+	// from token: /flush is a control action requested by the query side, not a
+	// data-ingest action. The query container holds only this token, so it can
+	// ask for a flush but can never write telemetry.
+	flushToken string
+	// flush makes buffered records durable on demand.
+	flush func() error
 }
 
 // New creates a receiver bound to host:port. Pass an empty host to listen on
 // all interfaces; the serve command passes "localhost" by default so a local
 // developer tool is not silently exposed to the network.
 //
-// token, when non-empty, is required as `Authorization: Bearer <token>` on the
+// token, when non-empty, is required as `Authorization: Bearer *** on the
 // OTLP endpoints. OTLP carries no auth in the message body — per the spec it is
 // transport-level, so exporters set it via HTTP headers
 // (OTEL_EXPORTER_OTLP_HEADERS). An empty token disables the check, which keeps
 // local development frictionless.
-func New(host string, port int, consumer Consumer, token string) *Receiver {
-	r := &Receiver{consumer: consumer, token: token}
+//
+// flushToken, when non-empty, is required on POST /flush. It is intentionally a
+// separate secret from token: the query container is given only flushToken, so
+// it can ask this process to flush without being able to forge telemetry.
+func New(host string, port int, consumer Consumer, token, flushToken string, flush func() error) *Receiver {
+	r := &Receiver{consumer: consumer, token: token, flushToken: flushToken, flush: flush}
 
 	mux := http.NewServeMux()
 	// OTLP ingest is authenticated when a token is configured.
 	mux.Handle("POST /v1/traces", r.authenticate(http.HandlerFunc(r.handleTraces)))
 	mux.Handle("POST /v1/logs", r.authenticate(http.HandlerFunc(r.handleLogs)))
 	mux.Handle("POST /v1/metrics", r.authenticate(http.HandlerFunc(r.handleMetrics)))
+	// Flush is a control action, authorised by its own token.
+	mux.Handle("POST /flush", httpauth.Bearer(flushToken, http.HandlerFunc(r.handleFlush)))
 	// Health stays unauthenticated so liveness/readiness probes keep working.
 	mux.HandleFunc("GET /health", r.handleHealth)
 
@@ -89,6 +102,29 @@ func New(host string, port int, consumer Consumer, token string) *Receiver {
 // configured but the request does not present it.
 func (r *Receiver) authenticate(next http.Handler) http.Handler {
 	return httpauth.Bearer(r.token, next)
+}
+
+// handleFlush makes buffered records durable on demand, so the query side can
+// ask for an immediate flush instead of waiting out the flush interval.
+//
+// Authenticated with flushToken (see New). Returns 503 when no flush function
+// is wired, so a misconfiguration is visible rather than silently accepted.
+func (r *Receiver) handleFlush(w http.ResponseWriter, req *http.Request) {
+	if r.flush == nil {
+		http.Error(w, "flush is not configured", http.StatusServiceUnavailable)
+		return
+	}
+	started := time.Now()
+	if err := r.flush(); err != nil {
+		log.Printf("flush requested over http: FAILED: %v", err)
+		http.Error(w, fmt.Sprintf("flush failed: %v", err), http.StatusInternalServerError)
+		return
+	}
+	log.Printf("flush requested over http: complete in %s",
+		time.Since(started).Round(time.Millisecond))
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte(`{"status":"flushed"}`))
 }
 
 func (r *Receiver) Start() error {

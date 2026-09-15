@@ -26,6 +26,7 @@ func mcpCmd() *cobra.Command {
 		port     int
 		token    string
 		basePath string
+		flushURL string
 	)
 
 	cmd := &cobra.Command{
@@ -39,6 +40,7 @@ metrics and time, and nothing about what any attribute means:
   trace_lookup(trace_id)                all spans of one trace
   span_search(filters, time_range)      spans matching arbitrary attribute filters
   metric_query(name, aggregation, ...)  metric aggregation over a range
+  flush_buffer()                        make just-received telemetry queryable now
 
 Every tool requires a tenant and hard-filters on the tenant.id resource
 attribute, so a caller cannot widen its scope.
@@ -52,15 +54,25 @@ Two transports:
                     (held by whoever consumes the data). Use a different value
                     for each so a compromised sender cannot read telemetry.
 
+--flush-url points at the receiving process's POST /flush. It is called with
+this server's own token, so the query side can request a flush without ever
+holding write access.
+
 Examples:
   ducktel mcp --data-dir /data
-  ducktel mcp --http --host 0.0.0.0 --port 4319 --auth-token "$READ_TOKEN"`,
+  ducktel mcp --http --host 0.0.0.0 --port 4319 --auth-token "$READ_TOKEN" \
+    --flush-url http://localhost:4318/flush`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			// Env wins only when the flag was not given, so an explicit flag
 			// can always override the environment.
 			if !cmd.Flags().Changed("auth-token") {
 				if v := os.Getenv("DUCKTEL_MCP_TOKEN"); v != "" {
 					token = v
+				}
+			}
+			if !cmd.Flags().Changed("flush-url") {
+				if v := os.Getenv("DUCKTEL_FLUSH_URL"); v != "" {
+					flushURL = v
 				}
 			}
 
@@ -75,7 +87,8 @@ Examples:
 					Name:    "ducktel",
 					Version: "0.1.0",
 				}, nil)
-				mcp.NewServer(engine).Register(srv)
+				// The flush request is authorised with this server's own token.
+				mcp.NewServer(engine, flushURL, token).Register(srv)
 				return srv
 			}
 
@@ -99,6 +112,7 @@ Examples:
 	cmd.Flags().IntVar(&port, "port", 4319, "Port to listen on in HTTP mode")
 	cmd.Flags().StringVar(&token, "auth-token", "", "Require this bearer token in HTTP mode (env: DUCKTEL_MCP_TOKEN)")
 	cmd.Flags().StringVar(&basePath, "base-path", "/mcp", "URL path to serve the MCP endpoint on in HTTP mode")
+	cmd.Flags().StringVar(&flushURL, "flush-url", "", "Writer's POST /flush endpoint, e.g. http://localhost:4318/flush; enables the flush_buffer tool (env: DUCKTEL_FLUSH_URL)")
 
 	return cmd
 }

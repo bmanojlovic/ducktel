@@ -63,7 +63,7 @@ func newTestServer(t *testing.T) (*sdkmcp.ClientSession, *query.Engine) {
 	t.Cleanup(func() { engine.Close() })
 
 	srv := sdkmcp.NewServer(&sdkmcp.Implementation{Name: "ducktel-test", Version: "test"}, nil)
-	NewServer(engine).Register(srv)
+	NewServer(engine, "", "").Register(srv)
 
 	clientT, serverT := sdkmcp.NewInMemoryTransports()
 
@@ -354,7 +354,7 @@ func TestSpanSearchDefaultWindowExcludesOldData(t *testing.T) {
 	defer engine.Close()
 
 	srv := sdkmcp.NewServer(&sdkmcp.Implementation{Name: "t", Version: "t"}, nil)
-	NewServer(engine).Register(srv)
+	NewServer(engine, "", "").Register(srv)
 	clientT, serverT := sdkmcp.NewInMemoryTransports()
 	ctx := context.Background()
 	srv.Connect(ctx, serverT, nil)
@@ -553,7 +553,7 @@ func TestQuoteIdentAllowlist(t *testing.T) {
 // TestUnused ensures helper coverage for the low-level store so the test file
 // does not silently skip the tenant attribute contract.
 func TestTenantAttributeName(t *testing.T) {
-	s := NewServer(nil)
+	s := NewServer(nil, "", "")
 	if s.tenantAttr != "tenant.id" {
 		t.Errorf("tenant attribute = %q, want tenant.id", s.tenantAttr)
 	}
