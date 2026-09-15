@@ -61,29 +61,46 @@ token would cross an untrusted network.`,
 			r := receiver.New(host, port, w, token)
 
 			sigCh := make(chan os.Signal, 1)
-			signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+			// SIGHUP requests an immediate flush without shutting down, so
+			// buffered telemetry can be made queryable on demand instead of
+			// waiting out the flush interval. Intercepting it also stops Go's
+			// default behaviour of terminating on SIGHUP.
+			signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
 
 			errCh := make(chan error, 1)
 			go func() {
 				errCh <- r.Start()
 			}()
 
-			select {
-			case err := <-errCh:
-				if err := w.Stop(); err != nil {
-					log.Printf("final flush failed: %v", err)
+			for {
+				select {
+				case err := <-errCh:
+					if err := w.Stop(); err != nil {
+						log.Printf("final flush failed: %v", err)
+					}
+					return err
+				case sig := <-sigCh:
+					if sig == syscall.SIGHUP {
+						// Flush in place: the receiver keeps serving and the
+						// writer keeps its buffer, so nothing is dropped.
+						log.Printf("received %s: flushing buffered telemetry", sig)
+						if err := w.Flush(); err != nil {
+							log.Printf("flush on %s failed: %v", sig, err)
+						} else {
+							log.Printf("flush on %s complete", sig)
+						}
+						continue
+					}
+					log.Printf("received %s: shutting down...", sig)
+					ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+					defer cancel()
+					r.Stop(ctx)
+					if err := w.Stop(); err != nil {
+						log.Printf("final flush failed: %v", err)
+					}
+					log.Println("Stopped.")
+					return nil
 				}
-				return err
-			case <-sigCh:
-				log.Println("Shutting down...")
-				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-				defer cancel()
-				r.Stop(ctx)
-				if err := w.Stop(); err != nil {
-					log.Printf("final flush failed: %v", err)
-				}
-				log.Println("Stopped.")
-				return nil
 			}
 		},
 	}
