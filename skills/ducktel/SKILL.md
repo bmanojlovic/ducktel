@@ -94,6 +94,45 @@ Show column names and types. Default view: `traces`. Valid: `traces`, `logs`, `m
 
 List distinct service names from traces.
 
+### `ducktel mcp`
+
+Serve telemetry queries over the Model Context Protocol on stdio, for agent consumers.
+
+```bash
+ducktel mcp --data-dir /data
+```
+
+Client configuration (spawned as a subprocess by the agent):
+
+```json
+{"command": "ducktel", "args": ["mcp", "--data-dir", "/data"]}
+```
+
+Three generic, domain-agnostic tools. They know about spans, attributes, metrics and
+time, and attach no meaning to any attribute key — domain interpretation is the
+caller's job.
+
+| Tool | Purpose |
+|------|---------|
+| `trace_lookup(trace_id, tenant)` | every span of one trace, ordered by start time |
+| `span_search(filters, service_name, since_minutes, tenant, limit)` | spans matching attribute key/value filters |
+| `metric_query(metric_name, aggregation, since_minutes, group_by, tenant)` | metric aggregation: avg, sum, min, max, count, p50, p95, p99 |
+
+**Tenant isolation is mandatory.** `tenant` is a *required* parameter on every tool —
+it is in the JSON schema, so a client cannot omit it — and every query hard-filters on
+the `tenant.id` resource attribute. A caller can restrict its scope but never widen it.
+
+**Dotted attribute keys work.** `span_search` takes filters as key/value pairs and
+quotes the key internally, because DuckDB treats `$.service.name` as field "service"
+then "name" and silently returns NULL. See the note under SQL Query Patterns.
+
+**Time windows default to 60 minutes.** Pass `since_minutes` for a wider range. There is
+no retention or pruning in ducktel, so unbounded scans would otherwise read all history.
+
+**Transport is stdio**, so the process boundary is the trust boundary and no token is
+needed. If HTTP transport is added later it should reuse the receiver's bearer token.
+
+
 ## SQL Query Patterns
 
 The query engine uses embedded DuckDB. Three views are available: `traces`, `logs`, `metrics`.
@@ -105,7 +144,7 @@ For common query patterns, see [references/queries.md](references/queries.md).
 
 - **Timestamps** are Unix microseconds (`int64`). Use `epoch_us(ts)` in DuckDB to convert.
 - **duration_ms** is precomputed as `float64` milliseconds.
-- **Attributes** (attributes, resource_attributes, events, links, exemplars) are stored as JSON strings. Use DuckDB JSON functions to query: `json_extract_string(attributes, '$.http.method')`.
+- **Attributes** (attributes, resource_attributes, events, links, exemplars) are stored as JSON strings. Query them with DuckDB JSON functions — but **quote dotted keys**: `json_extract_string(attributes, '$."http.method"')`. DuckDB reads `$.http.method` as field `http` then field `method` and returns NULL, so the unquoted form silently matches nothing for every OTel semantic-convention key. `attributes ->> 'http.method'` also works. See [references/schema.md](references/schema.md).
 - **Status codes** are strings: `STATUS_CODE_OK`, `STATUS_CODE_ERROR`, `STATUS_CODE_UNSET`.
 - **Span kinds** are strings: `SPAN_KIND_SERVER`, `SPAN_KIND_CLIENT`, `SPAN_KIND_PRODUCER`, `SPAN_KIND_CONSUMER`, `SPAN_KIND_INTERNAL`.
 - **Metric types** are lowercase strings: `gauge`, `sum`, `histogram`, `summary`.
