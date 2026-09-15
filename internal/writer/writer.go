@@ -2,6 +2,7 @@ package writer
 
 import (
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"sync"
@@ -96,6 +97,12 @@ func (w *Writer) AddMetrics(points []MetricPoint) {
 	}
 }
 
+// Flush writes all buffered records to disk, one file per signal.
+//
+// Records are taken off the buffer up front and put back if their write fails,
+// so a transient error (full disk, permission blip) retries next time instead
+// of discarding them. Successes are logged with counts and bytes so the
+// process log answers "is it flushing, and how much?" without extra tooling.
 func (w *Writer) Flush() error {
 	w.mu.Lock()
 	traces := w.traces
@@ -104,41 +111,62 @@ func (w *Writer) Flush() error {
 	w.traces, w.logs, w.metrics = nil, nil, nil
 	w.mu.Unlock()
 
-	// A failed write puts its records back at the head of the buffer so the
-	// next flush retries them. Without this a transient error (full disk,
-	// permission blip) silently discards everything buffered so far.
+	if len(traces) == 0 && len(logs) == 0 && len(metrics) == 0 {
+		// Nothing to do. Not logged: at a 30s interval this would be noise on
+		// an idle instance, and the absence of flush lines is itself the signal.
+		return nil
+	}
+
+	started := time.Now()
 	var firstErr error
-	if len(traces) > 0 {
-		if err := writeParquet(w.dataDir, "traces", traces); err != nil {
-			firstErr = err
-			w.mu.Lock()
-			dropped := requeue(&w.traces, traces)
-			w.mu.Unlock()
-			w.noteDropped("traces", dropped)
+
+	// writeParquet is called WITHOUT holding w.mu: it does filesystem I/O and
+	// must not block Add(). The requeue on failure re-acquires the lock — so
+	// the requeue closure below must NOT take it again (sync.Mutex is not
+	// reentrant; nesting the lock deadlocks).
+	flushOne := func(signal string, n int, write func() (string, error), requeueInto func(int) int) {
+		path, err := write()
+		if err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			dropped := requeueInto(n)
+			w.noteDropped(signal, dropped)
+			log.Printf("flush: %s FAILED (%d record(s) requeued): %v", signal, n, err)
+			return
 		}
+		log.Printf("flush: %s wrote %d record(s) to %s (%s)",
+			signal, n, path, time.Since(started).Round(time.Millisecond))
+	}
+
+	if len(traces) > 0 {
+		flushOne("traces", len(traces), func() (string, error) {
+			return writeParquet(w.dataDir, "traces", traces)
+		}, func(int) int {
+			w.mu.Lock()
+			defer w.mu.Unlock()
+			return requeue(&w.traces, traces)
+		})
 	}
 	if len(logs) > 0 {
-		if err := writeParquet(w.dataDir, "logs", logs); err != nil {
-			if firstErr == nil {
-				firstErr = err
-			}
+		flushOne("logs", len(logs), func() (string, error) {
+			return writeParquet(w.dataDir, "logs", logs)
+		}, func(int) int {
 			w.mu.Lock()
-			dropped := requeue(&w.logs, logs)
-			w.mu.Unlock()
-			w.noteDropped("logs", dropped)
-		}
+			defer w.mu.Unlock()
+			return requeue(&w.logs, logs)
+		})
 	}
 	if len(metrics) > 0 {
-		if err := writeParquet(w.dataDir, "metrics", metrics); err != nil {
-			if firstErr == nil {
-				firstErr = err
-			}
+		flushOne("metrics", len(metrics), func() (string, error) {
+			return writeParquet(w.dataDir, "metrics", metrics)
+		}, func(int) int {
 			w.mu.Lock()
-			dropped := requeue(&w.metrics, metrics)
-			w.mu.Unlock()
-			w.noteDropped("metrics", dropped)
-		}
+			defer w.mu.Unlock()
+			return requeue(&w.metrics, metrics)
+		})
 	}
+
 	return firstErr
 }
 
@@ -174,16 +202,16 @@ func requeue[T any](buf *[]T, records []T) (dropped int) {
 // can never leave a partial .parquet for the query glob to read — a truncated
 // file is silently reported as zero rows by DuckDB rather than raising, which
 // would make the loss invisible.
-func writeParquet[T any](dataDir, signal string, records []T) error {
+func writeParquet[T any](dataDir, signal string, records []T) (string, error) {
 	now := time.Now().UTC()
 	dir := filepath.Join(dataDir, signal, now.Format("2006-01-02"))
 	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return fmt.Errorf("creating %s dir: %w", signal, err)
+		return "", fmt.Errorf("creating %s dir: %w", signal, err)
 	}
 
 	tmp, err := os.CreateTemp(dir, ".tmp-*")
 	if err != nil {
-		return fmt.Errorf("creating temp file: %w", err)
+		return "", fmt.Errorf("creating temp file: %w", err)
 	}
 	tmpPath := tmp.Name()
 	// Best-effort cleanup if we bail before the rename succeeds.
@@ -192,29 +220,29 @@ func writeParquet[T any](dataDir, signal string, records []T) error {
 	pw := parquet.NewGenericWriter[T](tmp)
 	if _, err := pw.Write(records); err != nil {
 		tmp.Close()
-		return fmt.Errorf("writing %s: %w", signal, err)
+		return "", fmt.Errorf("writing %s: %w", signal, err)
 	}
 	if err := pw.Close(); err != nil {
 		tmp.Close()
-		return fmt.Errorf("closing parquet writer: %w", err)
+		return "", fmt.Errorf("closing parquet writer: %w", err)
 	}
 	// Flush the file's contents before the rename makes it visible.
 	if err := tmp.Sync(); err != nil {
 		tmp.Close()
-		return fmt.Errorf("syncing %s: %w", signal, err)
+		return "", fmt.Errorf("syncing %s: %w", signal, err)
 	}
 	if err := tmp.Close(); err != nil {
-		return fmt.Errorf("closing %s: %w", signal, err)
+		return "", fmt.Errorf("closing %s: %w", signal, err)
 	}
 
 	path, err := nextPath(dir, now)
 	if err != nil {
-		return err
+		return "", err
 	}
 	if err := os.Rename(tmpPath, path); err != nil {
-		return fmt.Errorf("committing %s: %w", signal, err)
+		return "", fmt.Errorf("committing %s: %w", signal, err)
 	}
-	return nil
+	return path, nil
 }
 
 // nextPath picks the first unused HH-MM[-n].parquet name in dir.

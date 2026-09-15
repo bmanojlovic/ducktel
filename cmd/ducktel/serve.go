@@ -45,9 +45,18 @@ token would cross an untrusted network.`,
 
 			w := writer.New(dataDir, flushInterval, 1000)
 			w.OnError(func(err error) {
-				log.Printf("writer flush failed: %v", err)
+				log.Printf("writer error: %v", err)
 			})
 			w.Start()
+
+			// Log the effective configuration once at startup: without it the
+			// log cannot be used to tell what a running instance was told to do.
+			authState := "disabled"
+			if token != "" {
+				authState = "enabled"
+			}
+			log.Printf("starting: data-dir=%s flush-interval=%s auth=%s",
+				dataDir, flushInterval, authState)
 
 			r := receiver.New(host, port, w, token)
 
