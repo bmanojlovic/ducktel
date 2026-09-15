@@ -16,6 +16,7 @@ import (
 
 func serveCmd() *cobra.Command {
 	var (
+		host          string
 		port          int
 		flushInterval time.Duration
 	)
@@ -27,7 +28,7 @@ func serveCmd() *cobra.Command {
 			w := writer.New(dataDir, flushInterval, 1000)
 			w.Start()
 
-			r := receiver.New(port, w)
+			r := receiver.New(host, port, w)
 
 			sigCh := make(chan os.Signal, 1)
 			signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
@@ -53,6 +54,7 @@ func serveCmd() *cobra.Command {
 		},
 	}
 
+	cmd.Flags().StringVar(&host, "host", "localhost", "Host/interface to bind (use 0.0.0.0 for all interfaces)")
 	cmd.Flags().IntVar(&port, "port", 4318, "Port to listen on")
 	cmd.Flags().DurationVar(&flushInterval, "flush-interval", 30*time.Second, "How often to flush buffered spans to disk")
 

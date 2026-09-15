@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -36,12 +38,12 @@ func startTestServer(t *testing.T) (string, *writer.Writer, func()) {
 	w.Start()
 
 	port := 14318
-	r := receiver.New(port, w)
+	r := receiver.New("localhost", port, w)
 	go r.Start()
 
 	addr := fmt.Sprintf("http://localhost:%d", port)
 	for i := 0; i < 20; i++ {
-		resp, err := http.Get(addr + "/")
+		resp, err := http.Get(addr + "/health")
 		if err == nil {
 			resp.Body.Close()
 			break
@@ -307,4 +309,63 @@ func TestMetrics(t *testing.T) {
 
 func ptrFloat64(f float64) *float64 {
 	return &f
+}
+
+// --- receiver hardening regression tests ---
+
+// TestRequestBodySizeLimit verifies an oversized body is rejected by the size
+// cap before being decoded. The receiver is unauthenticated, so without a cap
+// one client could make the process allocate without limit.
+//
+// The status code alone cannot distinguish a capped server from an uncapped
+// one: garbage bytes are invalid protobuf and yield 400 either way, but the
+// uncapped server has already buffered the whole body by then. So this asserts
+// on the cap's specific error message, and confirms a large-but-valid payload
+// under the limit is still accepted.
+func TestRequestBodySizeLimit(t *testing.T) {
+	addr, _, cleanup := startTestServer(t)
+	defer cleanup()
+
+	// Just over the receiver's 32 MiB cap (maxBodyBytes in internal/receiver).
+	oversized := bytes.Repeat([]byte("A"), 32<<20+1)
+	resp, err := http.Post(addr+"/v1/traces", "application/x-protobuf", bytes.NewReader(oversized))
+	if err != nil {
+		t.Fatalf("posting oversized body: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("oversized body returned %d, want %d", resp.StatusCode, http.StatusBadRequest)
+	}
+	if !strings.Contains(string(body), "exceeds") {
+		t.Errorf("oversized body was not rejected by the size cap (body: %q) — "+
+			"it was buffered and then failed protobuf decoding instead", strings.TrimSpace(string(body)))
+	}
+}
+
+// TestHealthEndpointIsNotCatchAll verifies the health handler is bound to
+// /health rather than GET /, which previously answered 200 for any unknown path
+// and masked typos in OTLP endpoints.
+func TestHealthEndpointIsNotCatchAll(t *testing.T) {
+	addr, _, cleanup := startTestServer(t)
+	defer cleanup()
+
+	resp, err := http.Get(addr + "/health")
+	if err != nil {
+		t.Fatalf("GET /health: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("GET /health returned %d, want 200", resp.StatusCode)
+	}
+
+	resp2, err := http.Get(addr + "/not-a-real-endpoint")
+	if err != nil {
+		t.Fatalf("GET /not-a-real-endpoint: %v", err)
+	}
+	resp2.Body.Close()
+	if resp2.StatusCode != http.StatusNotFound {
+		t.Errorf("unknown path returned %d, want 404", resp2.StatusCode)
+	}
 }
