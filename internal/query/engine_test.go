@@ -54,14 +54,9 @@ func TestAllViewsExist(t *testing.T) {
 	}
 }
 
-// TestQuerySeesDataWrittenAfterOpen documents a known bug: DuckDB resolves the
-// read_parquet glob when the view is created, so an engine opened before any
-// data existed keeps a `SELECT ... WHERE false` placeholder view and returns
-// zero rows even after Parquet files land. Per-query view re-derivation fixes
-// it, but that is a separate change.
-//
-// This asserts the *buggy* behaviour on purpose: when the refresh lands, the
-// test fails loudly and must be inverted, rather than quietly passing.
+// TestQuerySeesDataWrittenAfterOpen guards the stale-view fix: an engine
+// opened before any data existed must see Parquet files written afterwards,
+// because Query re-derives the views on each call.
 func TestQuerySeesDataWrittenAfterOpen(t *testing.T) {
 	dir := t.TempDir()
 	e, err := Open(dir)
@@ -84,9 +79,8 @@ func TestQuerySeesDataWrittenAfterOpen(t *testing.T) {
 	if err != nil {
 		t.Fatalf("query after data: %v", err)
 	}
-	if len(rows) != 0 {
-		t.Fatalf("views appear to be refreshed — this documents the stale-view bug; "+
-			"invert this assertion (got %d rows)", len(rows))
+	if len(rows) != 1 {
+		t.Fatalf("query after late write returned %d rows, want 1 (stale view)", len(rows))
 	}
 }
 
