@@ -1,10 +1,21 @@
 # ducktel — OTLP receiver + Parquet storage + DuckDB query.
 #
-# Single-writer by design: one replica, RWO-ish semantics. Scaling this to
-# multiple replicas would have two processes writing the same data directory
-# and silently losing data (collisions in the per-minute parquet filenames),
-# so the replica count is deliberately 1. Use a leader/follower arrangement if
-# HA is ever needed.
+# Two containers share one pod and one data volume:
+#   otlp  receives telemetry on 4318 (write side; token held by senders)
+#   mcp   serves queries on 4319    (read side;  token held by consumers)
+#
+# They are separate trust domains, so they carry separate tokens — see the
+# Secret below. A compromised sender must not gain read access, and a reader
+# must not be able to forge spans.
+#
+# Why two containers in one pod rather than two Deployments: the volume is
+# local-path (RWO, node-pinned), so a second Deployment could be scheduled onto
+# a node that does not hold the data. Sharing a pod guarantees co-location.
+#
+# Single writer by design: the otlp container is the only process that writes.
+# Scaling replicas would put two writers on one data directory and silently lose
+# telemetry (collisions in the per-minute parquet filenames), hence replicas: 1
+# and strategy Recreate.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -15,8 +26,7 @@ metadata:
 spec:
   replicas: 1
   strategy:
-    # Never run two writers at once, not even briefly during a rollout: a
-    # surge or an overlapping update would point two processes at one volume.
+    # Never run two writers at once, not even briefly during a rollout.
     type: Recreate
   selector:
     matchLabels:
@@ -31,7 +41,8 @@ spec:
         runAsUser: 65532 # distroless nonroot
         fsGroup: 65532
       containers:
-        - name: ducktel
+        # --- write side: OTLP ingest ---
+        - name: otlp
           image: ghcr.io/bmanojlovic/ducktel:current
           imagePullPolicy: Always
           args:
@@ -49,14 +60,11 @@ spec:
               containerPort: 4318
               protocol: TCP
           env:
-            # OTLP bearer auth. Set the token in the Secret below; leaving it
-            # unset disables authentication entirely.
             - name: DUCKTEL_AUTH_TOKEN
               valueFrom:
                 secretKeyRef:
-                  name: ducktel-auth
-                  key: token
-                  optional: true
+                  name: ducktel-tokens
+                  key: otlp-token
           livenessProbe:
             httpGet:
               path: /health
@@ -76,16 +84,90 @@ spec:
               cpu: 50m
               memory: 64Mi
             limits:
-              # ~27 MB observed at 100 traces/s, so 512 MiB leaves generous
-              # headroom while still bounding a leak instead of the node.
+              # ~27 MB observed at 100 traces/s, so 512 MiB bounds a leak
+              # without constraining normal operation.
               memory: 512Mi
           volumeMounts:
             - name: data
               mountPath: /data
+        # --- read side: MCP query tools ---
+        - name: mcp
+          image: ghcr.io/bmanojlovic/ducktel:current
+          imagePullPolicy: Always
+          args:
+            - mcp
+            - --http
+            - --host
+            - 0.0.0.0
+            - --port
+            - "4319"
+            - --base-path
+            - /mcp
+            - --data-dir
+            - /data
+          ports:
+            - name: mcp-http
+              containerPort: 4319
+              protocol: TCP
+          env:
+            # A DIFFERENT token from the OTLP one. This grants read access to
+            # every tenant, so it belongs only to consumers (e.g. a workstation
+            # querying over the VPN), never to senders.
+            - name: DUCKTEL_MCP_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: ducktel-tokens
+                  key: mcp-token
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: mcp-http
+            initialDelaySeconds: 5
+            periodSeconds: 30
+            timeoutSeconds: 3
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: mcp-http
+            initialDelaySeconds: 2
+            periodSeconds: 10
+            timeoutSeconds: 3
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              # Querying opens DuckDB over the parquet files; bound it so a
+              # large aggregation cannot take the node down.
+              memory: 1Gi
+          volumeMounts:
+            # Read-only: the MCP container never writes, which also makes it
+            # impossible for a query path to corrupt stored telemetry.
+            - name: data
+              mountPath: /data
+              readOnly: true
       volumes:
         - name: data
           persistentVolumeClaim:
             claimName: ducktel-data
+---
+# Two independent bearer tokens. Generate with:
+#   kubectl create secret generic ducktel-tokens -n ducktel \
+#     --from-literal=otlp-token="$(openssl rand -hex 32)" \
+#     --from-literal=mcp-token="$(openssl rand -hex 32)"
+#
+# This manifest declares the Secret with placeholder values so a fresh cluster
+# has something to mount; replace them before relying on the deployment, since
+# the values below are in version control.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: ducktel-tokens
+  namespace: ducktel
+type: Opaque
+stringData:
+  otlp-token: CHANGE-ME-otlp-write-token
+  mcp-token: CHANGE-ME-mcp-read-token
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -114,4 +196,21 @@ spec:
     - name: otlp-http
       port: 4318
       targetPort: otlp-http
+      protocol: TCP
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ducktel-mcp
+  namespace: ducktel
+  labels:
+    app.kubernetes.io/name: ducktel
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: ducktel
+  ports:
+    - name: mcp-http
+      port: 4319
+      targetPort: mcp-http
       protocol: TCP
