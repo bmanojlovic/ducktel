@@ -56,12 +56,12 @@ type Scenario struct {
 
 // Config holds the full harness configuration.
 type Config struct {
-	Endpoint  string     // OTLP HTTP endpoint (default http://localhost:4318)
+	Endpoint  string // OTLP HTTP endpoint (default http://localhost:4318)
 	Services  []Service
 	Scenarios []Scenario
-	TraceRate float64    // traces per second (default 2)
-	MetricsMs int        // metrics interval in ms (default 10000)
-	ErrorRate float64    // baseline error rate (default 0.05)
+	TraceRate float64 // traces per second (default 2)
+	MetricsMs int     // metrics interval in ms (default 10000)
+	ErrorRate float64 // baseline error rate (default 0.05)
 }
 
 // Harness generates and sends synthetic telemetry.
@@ -71,8 +71,8 @@ type Harness struct {
 	stop   chan struct{}
 	wg     sync.WaitGroup
 
-	svcMap   map[string]*Service
-	scenMap  map[string]*Scenario // service -> scenario
+	svcMap  map[string]*Service
+	scenMap map[string]*Scenario // service -> scenario
 }
 
 // New creates a harness from config, applying defaults.
@@ -240,27 +240,27 @@ func (h *Harness) generateTrace() {
 }
 
 type spanData struct {
-	TraceID      string
-	SpanID       string
-	ParentSpanID string
-	ServiceName  string
-	SpanName     string
-	Kind         int // 1=INTERNAL,2=SERVER,3=CLIENT
-	StartNano    int64
-	EndNano      int64
-	StatusCode   int // 0=UNSET,1=OK,2=ERROR
-	Attributes   map[string]interface{}
+	TraceID       string
+	SpanID        string
+	ParentSpanID  string
+	ServiceName   string
+	SpanName      string
+	Kind          int // 1=INTERNAL,2=SERVER,3=CLIENT
+	StartNano     int64
+	EndNano       int64
+	StatusCode    int // 0=UNSET,1=OK,2=ERROR
+	Attributes    map[string]interface{}
 	ResourceAttrs map[string]string
 }
 
 type logData struct {
-	Timestamp    int64
-	ServiceName  string
-	Severity     string
-	SeverityNum  int
-	Body         string
-	TraceID      string
-	SpanID       string
+	Timestamp     int64
+	ServiceName   string
+	Severity      string
+	SeverityNum   int
+	Body          string
+	TraceID       string
+	SpanID        string
 	ResourceAttrs map[string]string
 }
 
@@ -359,8 +359,8 @@ func (h *Harness) walkService(
 			dbEnd := childStart.Add(time.Duration(dbMs) * time.Millisecond)
 
 			dbAttrs := map[string]interface{}{
-				"db.system":    dep.DBSystem,
-				"db.name":      dep.DB,
+				"db.system":     dep.DBSystem,
+				"db.name":       dep.DB,
 				"net.peer.name": dep.DB,
 			}
 			switch dep.DBSystem {
@@ -442,14 +442,14 @@ func (h *Harness) walkService(
 
 func (h *Harness) resourceAttrs(svc *Service) map[string]string {
 	return map[string]string{
-		"service.name":             svc.Name,
-		"service.version":          "1.0.0",
-		"telemetry.sdk.language":   svc.Language,
-		"telemetry.sdk.name":       "opentelemetry",
-		"deployment.environment":   "production",
-		"host.name":               fmt.Sprintf("k8s-node-%s", svc.Name),
-		"k8s.namespace.name":       "default",
-		"k8s.pod.name":            fmt.Sprintf("%s-7f8b9c-x4k2p", svc.Name),
+		"service.name":           svc.Name,
+		"service.version":        "1.0.0",
+		"telemetry.sdk.language": svc.Language,
+		"telemetry.sdk.name":     "opentelemetry",
+		"deployment.environment": "production",
+		"host.name":              fmt.Sprintf("k8s-node-%s", svc.Name),
+		"k8s.namespace.name":     "default",
+		"k8s.pod.name":           fmt.Sprintf("%s-7f8b9c-x4k2p", svc.Name),
 	}
 }
 
@@ -588,14 +588,14 @@ func (h *Harness) sendTraces(spans []spanData) {
 		var otlpSpans []interface{}
 		for _, s := range svcSpans {
 			sp := map[string]interface{}{
-				"traceId":            s.TraceID,
-				"spanId":             s.SpanID,
-				"name":               s.SpanName,
-				"kind":               s.Kind,
-				"startTimeUnixNano":  fmt.Sprintf("%d", s.StartNano),
-				"endTimeUnixNano":    fmt.Sprintf("%d", s.EndNano),
-				"status":             map[string]interface{}{"code": s.StatusCode},
-				"attributes":         formatAttrs(s.Attributes),
+				"traceId":           s.TraceID,
+				"spanId":            s.SpanID,
+				"name":              s.SpanName,
+				"kind":              s.Kind,
+				"startTimeUnixNano": fmt.Sprintf("%d", s.StartNano),
+				"endTimeUnixNano":   fmt.Sprintf("%d", s.EndNano),
+				"status":            map[string]interface{}{"code": s.StatusCode},
+				"attributes":        formatAttrs(s.Attributes),
 			}
 			if s.ParentSpanID != "" {
 				sp["parentSpanId"] = s.ParentSpanID
@@ -636,10 +636,10 @@ func (h *Harness) sendLogs(entries []logData) {
 		var records []interface{}
 		for _, l := range svcLogs {
 			rec := map[string]interface{}{
-				"timeUnixNano":  fmt.Sprintf("%d", l.Timestamp),
-				"severityText":  l.Severity,
+				"timeUnixNano":   fmt.Sprintf("%d", l.Timestamp),
+				"severityText":   l.Severity,
 				"severityNumber": l.SeverityNum,
-				"body":          map[string]interface{}{"stringValue": l.Body},
+				"body":           map[string]interface{}{"stringValue": l.Body},
 			}
 			if l.TraceID != "" {
 				rec["traceId"] = l.TraceID
