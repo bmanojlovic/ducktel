@@ -25,6 +25,9 @@ func serveCmd() *cobra.Command {
 		Short: "Start the OTLP receiver",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			w := writer.New(dataDir, flushInterval, 1000)
+			w.OnError(func(err error) {
+				log.Printf("writer flush failed: %v", err)
+			})
 			w.Start()
 
 			r := receiver.New(port, w)
@@ -39,14 +42,18 @@ func serveCmd() *cobra.Command {
 
 			select {
 			case err := <-errCh:
-				w.Stop()
+				if err := w.Stop(); err != nil {
+					log.Printf("final flush failed: %v", err)
+				}
 				return err
 			case <-sigCh:
 				log.Println("Shutting down...")
 				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 				defer cancel()
 				r.Stop(ctx)
-				w.Stop()
+				if err := w.Stop(); err != nil {
+					log.Printf("final flush failed: %v", err)
+				}
 				log.Println("Stopped.")
 				return nil
 			}
