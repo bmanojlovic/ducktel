@@ -135,9 +135,14 @@ func (s *Server) spanSearch(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 		if f.Key == "" {
 			return errResult("attribute filter key must not be empty")
 		}
-		// jsonPath quotes the key; the key itself is a bound parameter.
-		conds = append(conds, "json_extract_string(attributes, ?) = ?")
-		params = append(params, jsonPath(f.Key), f.Value)
+		// Search span attributes AND resource attributes: a caller should not
+		// need to know which one a key lives in. `service.name`, for example,
+		// arrives as a resource attribute (and is additionally promoted to the
+		// service_name column) but is absent from span attributes — filtering
+		// only attributes silently matches nothing for the most common key.
+		conds = append(conds,
+			"(json_extract_string(attributes, ?) = ? OR json_extract_string(resource_attributes, ?) = ?)")
+		params = append(params, jsonPath(f.Key), f.Value, jsonPath(f.Key), f.Value)
 	}
 
 	params = append(params, limit)
