@@ -2,6 +2,7 @@ package receiver
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -9,6 +10,7 @@ import (
 	"io"
 	"log"
 	"math"
+	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -47,18 +49,27 @@ const (
 type Receiver struct {
 	server   *http.Server
 	consumer Consumer
+	token    string
 }
 
 // New creates a receiver bound to host:port. Pass an empty host to listen on
 // all interfaces; the serve command passes "localhost" by default so a local
 // developer tool is not silently exposed to the network.
-func New(host string, port int, consumer Consumer) *Receiver {
-	r := &Receiver{consumer: consumer}
+//
+// token, when non-empty, is required as `Authorization: Bearer <token>` on the
+// OTLP endpoints. OTLP carries no auth in the message body — per the spec it is
+// transport-level, so exporters set it via HTTP headers
+// (OTEL_EXPORTER_OTLP_HEADERS). An empty token disables the check, which keeps
+// local development frictionless.
+func New(host string, port int, consumer Consumer, token string) *Receiver {
+	r := &Receiver{consumer: consumer, token: token}
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("POST /v1/traces", r.handleTraces)
-	mux.HandleFunc("POST /v1/logs", r.handleLogs)
-	mux.HandleFunc("POST /v1/metrics", r.handleMetrics)
+	// OTLP ingest is authenticated when a token is configured.
+	mux.Handle("POST /v1/traces", r.authenticate(http.HandlerFunc(r.handleTraces)))
+	mux.Handle("POST /v1/logs", r.authenticate(http.HandlerFunc(r.handleLogs)))
+	mux.Handle("POST /v1/metrics", r.authenticate(http.HandlerFunc(r.handleMetrics)))
+	// Health stays unauthenticated so liveness/readiness probes keep working.
 	mux.HandleFunc("GET /health", r.handleHealth)
 
 	r.server = &http.Server{
@@ -72,8 +83,42 @@ func New(host string, port int, consumer Consumer) *Receiver {
 	return r
 }
 
+// authenticate wraps a handler with a bearer-token check. It is a no-op when no
+// token is configured, and fails closed (401) when one is configured but the
+// request does not present it.
+//
+// The `Bearer ` prefix is required, per RFC 6750. A bare token is rejected —
+// accepting both would mean accepting malformed credentials, and strictness
+// costs senders nothing since OTEL_EXPORTER_OTLP_HEADERS sets whatever you write.
+func (r *Receiver) authenticate(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if r.token == "" {
+			next.ServeHTTP(w, req)
+			return
+		}
+		auth := req.Header.Get("Authorization")
+		scheme, cred, ok := strings.Cut(auth, " ")
+		if !ok || !strings.EqualFold(scheme, "Bearer") {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		// Constant-time compare so the token cannot be recovered by timing.
+		if subtle.ConstantTimeCompare([]byte(cred), []byte(r.token)) != 1 {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		next.ServeHTTP(w, req)
+	})
+}
+
 func (r *Receiver) Start() error {
 	log.Printf("OTLP receiver listening on %s", r.server.Addr)
+	if r.token == "" {
+		if host, _, err := net.SplitHostPort(r.server.Addr); err == nil && host != "localhost" && host != "127.0.0.1" {
+			log.Printf("warning: no auth token configured and bound to %s — "+
+				"any client that can reach this port can write telemetry", r.server.Addr)
+		}
+	}
 	if err := r.server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		return err
 	}

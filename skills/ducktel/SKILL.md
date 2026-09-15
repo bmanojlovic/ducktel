@@ -35,12 +35,42 @@ All commands accept `--data-dir` (default: `./data`) and `--format json|table|cs
 Start the OTLP HTTP receiver.
 
 ```bash
-ducktel serve                          # default: port 4318, flush every 30s
+ducktel serve                          # default: localhost:4318, flush every 30s
 ducktel serve --port 9090              # custom port
+ducktel serve --host 0.0.0.0           # all interfaces (containers)
 ducktel serve --flush-interval 10s     # flush every 10 seconds
+ducktel serve --auth-token secret      # require a bearer token
 ```
 
-Endpoints: `POST /v1/traces`, `POST /v1/logs`, `POST /v1/metrics`, `GET /` (health).
+Endpoints: `POST /v1/traces`, `POST /v1/logs`, `POST /v1/metrics`, `GET /health`.
+
+#### Authentication
+
+Disabled unless a token is configured. Set it with `--auth-token` or
+`DUCKTEL_AUTH_TOKEN` (an explicit flag wins over the environment):
+
+```bash
+DUCKTEL_AUTH_TOKEN=secret ducktel serve --host 0.0.0.0
+```
+
+Senders must then present `Authorization: Bearer <token>`. Every OTel SDK
+supports this via one environment variable, so no instrumentation changes are
+needed:
+
+```bash
+export OTEL_EXPORTER_OTLP_HEADERS="Authorization=Bearer secret"
+```
+
+- OTLP carries no credentials in the message body — per the spec, auth is
+  transport-level, hence headers.
+- `GET /health` stays unauthenticated so liveness/readiness probes keep working.
+- A 401 is returned for a missing, malformed, or wrong credential. The scheme
+  name is case-insensitive; the `Bearer ` prefix is required.
+- **TLS is not terminated by ducktel.** If the token would cross an untrusted
+  network, front the receiver with a proxy or ingress. OTLP/HTTP is
+  request/response rather than a persistent connection, so a terminating proxy is
+  a natural fit.
+- Starting without a token while bound to a non-loopback address logs a warning.
 
 ### `ducktel query [sql]`
 

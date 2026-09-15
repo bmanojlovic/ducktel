@@ -32,6 +32,13 @@ import (
 
 func startTestServer(t *testing.T) (string, *writer.Writer, func()) {
 	t.Helper()
+	return startTestServerWithToken(t, "")
+}
+
+// startTestServerWithToken is startTestServer with an optional bearer token, so
+// tests can exercise the authenticated path.
+func startTestServerWithToken(t *testing.T, token string) (string, *writer.Writer, func()) {
+	t.Helper()
 
 	dataDir, err := os.MkdirTemp("", "ducktel-test-*")
 	if err != nil {
@@ -42,7 +49,7 @@ func startTestServer(t *testing.T) (string, *writer.Writer, func()) {
 	w.Start()
 
 	port := 14318
-	r := receiver.New("localhost", port, w)
+	r := receiver.New("localhost", port, w, token)
 	go r.Start()
 
 	addr := fmt.Sprintf("http://localhost:%d", port)
