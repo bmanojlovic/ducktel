@@ -54,6 +54,7 @@ spec:
     kind: ClusterIssuer
   dnsNames:
     - otel.ext.steki.org
+    - mcp.ext.steki.org
 ---
 # Public name: Let's Encrypt certificate.
 apiVersion: traefik.io/v1alpha1
@@ -71,6 +72,30 @@ spec:
       services:
         - name: ducktel
           port: 4318
+  tls:
+    secretName: ducktel-tls-ext
+---
+# MCP over the public hostname, so a workstation can consume it with a
+# publicly-trusted certificate and no CA installation.
+#
+# This endpoint reads EVERY tenant with one bearer token, so it is the most
+# sensitive surface ducktel exposes: the token is the whole boundary. Traefik
+# terminates TLS and forwards plain HTTP to the ClusterIP service.
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: ducktel-mcp-ext
+  namespace: ducktel
+spec:
+  entryPoints:
+    - web
+    - websecure
+  routes:
+    - kind: Rule
+      match: Host(`mcp.ext.steki.org`)
+      services:
+        - name: ducktel-mcp
+          port: 4319
   tls:
     secretName: ducktel-tls-ext
 ---
