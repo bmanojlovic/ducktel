@@ -60,11 +60,22 @@ spec:
               containerPort: 4318
               protocol: TCP
           env:
+            # The writer holds BOTH secrets:
+            #   DUCKTEL_AUTH_TOKEN  authorises OTLP ingest (held by senders)
+            #   DUCKTEL_MCP_TOKEN   authorises POST /flush, so the query
+            #                       container can ask for a flush without ever
+            #                       holding write access. serve() accepts the
+            #                       MCP token on /flush for exactly this reason.
             - name: DUCKTEL_AUTH_TOKEN
               valueFrom:
                 secretKeyRef:
                   name: ducktel-tokens
                   key: otlp-token
+            - name: DUCKTEL_MCP_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: ducktel-tokens
+                  key: mcp-token
           livenessProbe:
             httpGet:
               path: /health
@@ -105,6 +116,12 @@ spec:
             - /mcp
             - --data-dir
             - /data
+            - --flush-url
+            # Same pod, so the writer is reachable on localhost. The request is
+            # authorised with this container's own (read) token, which the
+            # writer accepts on /flush — so this container can trigger a flush
+            # but never holds write access.
+            - http://localhost:4318/flush
           ports:
             - name: mcp-http
               containerPort: 4319
