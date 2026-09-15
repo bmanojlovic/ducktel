@@ -308,3 +308,89 @@ func TestMetrics(t *testing.T) {
 func ptrFloat64(f float64) *float64 {
 	return &f
 }
+
+// --- view refresh regression tests ---
+
+// seedTrace writes one span with the given service and flushes it.
+func seedTrace(t *testing.T, dir, service string) {
+	t.Helper()
+	w := writer.New(dir, 1*time.Hour, 1000)
+	now := time.Now()
+	w.Add([]writer.TraceSpan{{
+		TraceID: "t", SpanID: "s", ServiceName: service, SpanName: "op",
+		StartTime: now.UnixMicro(), EndTime: now.UnixMicro(), DurationMs: 1,
+		StatusCode: "STATUS_CODE_OK", Attributes: "{}",
+		ResourceAttributes: "{}", Events: "[]", Links: "[]",
+	}})
+	if err := w.Flush(); err != nil {
+		t.Fatalf("seeding %s: %v", service, err)
+	}
+}
+
+// TestViewsRefreshAfterDataArrives covers a staleness bug: DuckDB resolves a
+// read_parquet glob when the view is created. An engine opened before any data
+// existed installed a placeholder `SELECT ... WHERE false` view and kept
+// returning zero rows forever, even once Parquet files were on disk. Anything
+// long-lived (a serve process, an agent's periodic check loop) silently saw
+// nothing.
+func TestViewsRefreshAfterDataArrives(t *testing.T) {
+	dir := t.TempDir()
+
+	// Open before any data exists, so the empty-placeholder path is taken.
+	engine, err := query.Open(dir)
+	if err != nil {
+		t.Fatalf("opening query engine: %v", err)
+	}
+	defer engine.Close()
+
+	before, _, err := engine.Query("SELECT count(*) AS c FROM traces")
+	if err != nil {
+		t.Fatalf("query before data: %v", err)
+	}
+	if before[0]["c"].(int64) != 0 {
+		t.Fatalf("expected 0 rows before data, got %v", before[0]["c"])
+	}
+
+	// Data arrives while the engine is still open.
+	seedTrace(t, dir, "late-svc")
+
+	after, _, err := engine.Query("SELECT service_name FROM traces")
+	if err != nil {
+		t.Fatalf("query after data: %v", err)
+	}
+	if len(after) != 1 {
+		t.Fatalf("same engine returned %d rows after data was written, want 1 — "+
+			"views are stale", len(after))
+	}
+
+	// A later batch must be picked up too.
+	seedTrace(t, dir, "later-svc")
+	count, _, err := engine.Query("SELECT count(*) AS c FROM traces")
+	if err != nil {
+		t.Fatalf("query after second batch: %v", err)
+	}
+	if got := count[0]["c"].(int64); got != 2 {
+		t.Errorf("after a second batch, count = %d, want 2", got)
+	}
+}
+
+// TestDescribeRefreshesViews verifies schema introspection also observes data
+// that arrived after the engine was opened.
+func TestDescribeRefreshesViews(t *testing.T) {
+	dir := t.TempDir()
+	engine, err := query.Open(dir)
+	if err != nil {
+		t.Fatalf("opening query engine: %v", err)
+	}
+	defer engine.Close()
+
+	seedTrace(t, dir, "svc")
+
+	cols, err := engine.Describe("traces")
+	if err != nil {
+		t.Fatalf("describe: %v", err)
+	}
+	if len(cols) == 0 {
+		t.Error("Describe returned no columns for a populated store — view is stale")
+	}
+}
