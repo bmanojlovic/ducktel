@@ -4,8 +4,11 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
+	"math"
 	"net/http"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -19,6 +22,7 @@ import (
 	tracev1 "go.opentelemetry.io/proto/otlp/trace/v1"
 	"google.golang.org/protobuf/proto"
 
+	"github.com/davidgeorgehope/ducktel/internal/cli"
 	"github.com/davidgeorgehope/ducktel/internal/query"
 	"github.com/davidgeorgehope/ducktel/internal/receiver"
 	"github.com/davidgeorgehope/ducktel/internal/writer"
@@ -307,4 +311,66 @@ func TestMetrics(t *testing.T) {
 
 func ptrFloat64(f float64) *float64 {
 	return &f
+}
+
+// TestNonFiniteFloatsAreSanitized guards against NaN/Inf reaching the store.
+// OTLP permits them in float fields, but Go's JSON encoder rejects them
+// ("json: unsupported value: NaN"), so without sanitizing at ingest a single
+// bad measurement breaks `ducktel metrics --format json` for the whole result
+// set — the CLI's default output format.
+func TestNonFiniteFloatsAreSanitized(t *testing.T) {
+	addr, w, cleanup := startTestServer(t)
+	defer cleanup()
+	dataDir := w.DataDir()
+
+	now := fmt.Sprintf("%d", time.Now().UnixNano())
+
+	// JSON ingestion is used because NaN/Inf are expressible as JSON strings.
+	// Covers gauge, histogram min/max/sum, summary quantiles, and exemplars.
+	bodies := []string{
+		`{"resourceMetrics":[{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"nan-svc"}}]},"scopeMetrics":[{"scope":{"name":"t"},"metrics":[{"name":"g","gauge":{"dataPoints":[{"timeUnixNano":"` + now + `","asDouble":"NaN"}]}}]}]}]}`,
+		`{"resourceMetrics":[{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"nan-svc"}}]},"scopeMetrics":[{"scope":{"name":"t"},"metrics":[{"name":"h","histogram":{"aggregationTemporality":2,"dataPoints":[{"timeUnixNano":"` + now + `","count":"5","sum":"NaN","min":"NaN","max":"Infinity","bucketCounts":["1"],"explicitBounds":["1"]}]}}]}]}]}`,
+		`{"resourceMetrics":[{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"nan-svc"}}]},"scopeMetrics":[{"scope":{"name":"t"},"metrics":[{"name":"s","summary":{"dataPoints":[{"timeUnixNano":"` + now + `","count":"3","sum":"NaN","quantileValues":[{"quantile":"0.5","value":"NaN"}]}]}}]}]}]}`,
+	}
+	for i, b := range bodies {
+		resp, err := http.Post(addr+"/v1/metrics", "application/json", strings.NewReader(b))
+		if err != nil {
+			t.Fatalf("posting body %d: %v", i, err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("body %d returned status %d", i, resp.StatusCode)
+		}
+	}
+
+	w.Flush()
+
+	engine, err := query.Open(dataDir)
+	if err != nil {
+		t.Fatalf("opening query engine: %v", err)
+	}
+	defer engine.Close()
+
+	results, columns, err := engine.Query(
+		"SELECT metric_name, value_double, sum, min, max, quantile_values, exemplars FROM metrics ORDER BY 1")
+	if err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	if len(results) != 3 {
+		t.Fatalf("expected 3 metric points, got %d", len(results))
+	}
+
+	// No float in the result set may be NaN/Inf.
+	for _, row := range results {
+		for _, col := range []string{"value_double", "sum", "min", "max"} {
+			if v, ok := row[col].(float64); ok && (math.IsNaN(v) || math.IsInf(v, 0)) {
+				t.Errorf("%s of metric %v is still non-finite: %v", col, row["metric_name"], v)
+			}
+		}
+	}
+
+	// The actual regression: the default output format must not fail.
+	if err := cli.FormatResults(io.Discard, results, columns, "json"); err != nil {
+		t.Errorf("--format json failed on non-finite input: %v", err)
+	}
 }
