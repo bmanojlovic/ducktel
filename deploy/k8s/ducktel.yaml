@@ -1,0 +1,117 @@
+# ducktel — OTLP receiver + Parquet storage + DuckDB query.
+#
+# Single-writer by design: one replica, RWO-ish semantics. Scaling this to
+# multiple replicas would have two processes writing the same data directory
+# and silently losing data (collisions in the per-minute parquet filenames),
+# so the replica count is deliberately 1. Use a leader/follower arrangement if
+# HA is ever needed.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ducktel
+  namespace: ducktel
+  labels:
+    app.kubernetes.io/name: ducktel
+spec:
+  replicas: 1
+  strategy:
+    # Never run two writers at once, not even briefly during a rollout: a
+    # surge or an overlapping update would point two processes at one volume.
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ducktel
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ducktel
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532 # distroless nonroot
+        fsGroup: 65532
+      containers:
+        - name: ducktel
+          image: ghcr.io/bmanojlovic/ducktel:current
+          imagePullPolicy: Always
+          args:
+            - serve
+            - --host
+            - 0.0.0.0
+            - --port
+            - "4318"
+            - --data-dir
+            - /data
+            - --flush-interval
+            - 30s
+          ports:
+            - name: otlp-http
+              containerPort: 4318
+              protocol: TCP
+          env:
+            # OTLP bearer auth. Set the token in the Secret below; leaving it
+            # unset disables authentication entirely.
+            - name: DUCKTEL_AUTH_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: ducktel-auth
+                  key: token
+                  optional: true
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: otlp-http
+            initialDelaySeconds: 5
+            periodSeconds: 30
+            timeoutSeconds: 3
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: otlp-http
+            initialDelaySeconds: 2
+            periodSeconds: 10
+            timeoutSeconds: 3
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              # ~27 MB observed at 100 traces/s, so 512 MiB leaves generous
+              # headroom while still bounding a leak instead of the node.
+              memory: 512Mi
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: ducktel-data
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ducktel-data
+  namespace: ducktel
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ducktel
+  namespace: ducktel
+  labels:
+    app.kubernetes.io/name: ducktel
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: ducktel
+  ports:
+    - name: otlp-http
+      port: 4318
+      targetPort: otlp-http
+      protocol: TCP

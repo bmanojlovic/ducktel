@@ -1,0 +1,52 @@
+# Internal CA for cluster-internal names.
+#
+# otel.steki.org is not publicly resolvable (LAN/VPN only), so ACME HTTP-01
+# cannot validate it — verified: in one Certificate covering both names, the
+# challenge for otel.ext.steki.org went valid while otel.steki.org stayed
+# pending.
+#
+# NOTE ON NAMESPACES: this cluster runs cert-manager with
+# --cluster-resource-namespace=$(POD_NAMESPACE), so a ClusterIssuer resolves its
+# CA secret in the cert-manager namespace, NOT in the namespace of the
+# Certificate using it. Therefore the CA Certificate below is created in
+# cert-manager. Putting it in the application namespace produces a
+# permanent "secrets \"...\" not found" on the issuer — verified.
+#
+# Export the trust anchor for senders that need to trust the internal name:
+#   kubectl get secret -n cert-manager ducktel-internal-ca \
+#     -o jsonpath='{.data.ca\.crt}' | base64 -d > ducktel-ca.crt
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: ducktel-internal-ca
+spec:
+  selfSigned: {}
+---
+# The CA keypair. Lives in cert-manager because that is where the issuer
+# resolves ClusterIssuer CA references on this cluster.
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: ducktel-internal-ca
+  namespace: cert-manager
+spec:
+  isCA: true
+  commonName: ducktel-internal-ca
+  secretName: ducktel-internal-ca
+  duration: 87600h # 10y — a CA should outlive the leaves it signs
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+  issuerRef:
+    name: ducktel-internal-ca
+    kind: ClusterIssuer
+    group: cert-manager.io
+---
+# CA-backed issuer used for the actual serving certificate.
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: ducktel-internal
+spec:
+  ca:
+    secretName: ducktel-internal-ca

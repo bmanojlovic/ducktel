@@ -1,0 +1,113 @@
+# Ingress for the OTLP receiver.
+#
+# Two hostnames, two issuers, therefore TWO routers: a Traefik router serves one
+# certificate (its tls.secretName), so a single router covering both hosts can
+# only present one of them — the other falls back to Traefik's default
+# self-signed certificate. Verified with openssl s_client: a combined router
+# returned CN=TRAEFIK DEFAULT CERT for the internal name.
+#
+#   otel.ext.steki.org  public   -> Let's Encrypt (ACME HTTP-01)
+#   otel.steki.org      internal -> ducktel-internal CA (ACME cannot validate a
+#                                  name that is not publicly resolvable)
+#
+# Both terminate TLS at Traefik and forward plain HTTP to the ClusterIP
+# service — ducktel does not terminate TLS itself.
+#
+# Other cluster constraints found in Traefik's logs:
+#   - cross-namespace middleware references are DISABLED, so the redirect
+#     middleware is created here rather than referenced from `default`.
+#   - a router whose tls.secretName does not exist yet logs "Error configuring
+#     TLS ... does not exist" and silently serves the default certificate, so
+#     the Certificates are declared before the routers below.
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: redirect-https
+  namespace: ducktel
+spec:
+  redirectScheme:
+    scheme: https
+    permanent: true
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: ducktel-tls-internal
+  namespace: ducktel
+spec:
+  secretName: ducktel-tls-internal
+  issuerRef:
+    name: ducktel-internal
+    kind: ClusterIssuer
+  dnsNames:
+    - otel.steki.org
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: ducktel-tls-ext
+  namespace: ducktel
+spec:
+  secretName: ducktel-tls-ext
+  issuerRef:
+    name: letsencrypt
+    kind: ClusterIssuer
+  dnsNames:
+    - otel.ext.steki.org
+---
+# Public name: Let's Encrypt certificate.
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: ducktel-ext
+  namespace: ducktel
+spec:
+  entryPoints:
+    - web
+    - websecure
+  routes:
+    - kind: Rule
+      match: Host(`otel.ext.steki.org`)
+      services:
+        - name: ducktel
+          port: 4318
+  tls:
+    secretName: ducktel-tls-ext
+---
+# Internal name: certificate from the self-signed ducktel-internal CA.
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: ducktel
+  namespace: ducktel
+spec:
+  entryPoints:
+    - web
+    - websecure
+  routes:
+    - kind: Rule
+      match: Host(`otel.steki.org`)
+      services:
+        - name: ducktel
+          port: 4318
+  tls:
+    secretName: ducktel-tls-internal
+---
+# HTTP -> HTTPS for both names, so a sender configured with a plain http://
+# endpoint is redirected rather than silently posting in the clear.
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: ducktel-redirect
+  namespace: ducktel
+spec:
+  entryPoints:
+    - web
+  routes:
+    - kind: Rule
+      match: Host(`otel.steki.org`) || Host(`otel.ext.steki.org`)
+      middlewares:
+        - name: redirect-https
+      services:
+        - name: ducktel
+          port: 4318

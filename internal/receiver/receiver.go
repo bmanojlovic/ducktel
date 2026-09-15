@@ -2,7 +2,6 @@ package receiver
 
 import (
 	"context"
-	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -14,6 +13,8 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/davidgeorgehope/ducktel/internal/httpauth"
 
 	collectlogsv1 "go.opentelemetry.io/proto/otlp/collector/logs/v1"
 	collectmetricsv1 "go.opentelemetry.io/proto/otlp/collector/metrics/v1"
@@ -83,32 +84,11 @@ func New(host string, port int, consumer Consumer, token string) *Receiver {
 	return r
 }
 
-// authenticate wraps a handler with a bearer-token check. It is a no-op when no
-// token is configured, and fails closed (401) when one is configured but the
-// request does not present it.
-//
-// The `Bearer ` prefix is required, per RFC 6750. A bare token is rejected —
-// accepting both would mean accepting malformed credentials, and strictness
-// costs senders nothing since OTEL_EXPORTER_OTLP_HEADERS sets whatever you write.
+// authenticate wraps a handler with the shared bearer-token check. It is a
+// no-op when no token is configured, and fails closed (401) when one is
+// configured but the request does not present it.
 func (r *Receiver) authenticate(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		if r.token == "" {
-			next.ServeHTTP(w, req)
-			return
-		}
-		auth := req.Header.Get("Authorization")
-		scheme, cred, ok := strings.Cut(auth, " ")
-		if !ok || !strings.EqualFold(scheme, "Bearer") {
-			http.Error(w, "unauthorized", http.StatusUnauthorized)
-			return
-		}
-		// Constant-time compare so the token cannot be recovered by timing.
-		if subtle.ConstantTimeCompare([]byte(cred), []byte(r.token)) != 1 {
-			http.Error(w, "unauthorized", http.StatusUnauthorized)
-			return
-		}
-		next.ServeHTTP(w, req)
-	})
+	return httpauth.Bearer(r.token, next)
 }
 
 func (r *Receiver) Start() error {
@@ -137,6 +117,7 @@ func (r *Receiver) handleHealth(w http.ResponseWriter, req *http.Request) {
 // --- Traces ---
 
 func (r *Receiver) handleTraces(w http.ResponseWriter, req *http.Request) {
+	started := time.Now()
 	exportReq := &collecttracev1.ExportTraceServiceRequest{}
 	if err := unmarshalOTLP(req, exportReq); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -146,6 +127,8 @@ func (r *Receiver) handleTraces(w http.ResponseWriter, req *http.Request) {
 	spans := convertSpans(exportReq)
 	if len(spans) > 0 {
 		r.consumer.Add(spans)
+		log.Printf("ingest: traces accepted %d span(s) in %s",
+			len(spans), time.Since(started).Round(time.Millisecond))
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -204,6 +187,7 @@ func convertSpans(req *collecttracev1.ExportTraceServiceRequest) []writer.TraceS
 // --- Logs ---
 
 func (r *Receiver) handleLogs(w http.ResponseWriter, req *http.Request) {
+	started := time.Now()
 	exportReq := &collectlogsv1.ExportLogsServiceRequest{}
 	if err := unmarshalOTLP(req, exportReq); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -213,6 +197,8 @@ func (r *Receiver) handleLogs(w http.ResponseWriter, req *http.Request) {
 	records := convertLogs(exportReq)
 	if len(records) > 0 {
 		r.consumer.AddLogs(records)
+		log.Printf("ingest: logs accepted %d record(s) in %s",
+			len(records), time.Since(started).Round(time.Millisecond))
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -262,6 +248,7 @@ func convertLogs(req *collectlogsv1.ExportLogsServiceRequest) []writer.LogRecord
 // --- Metrics ---
 
 func (r *Receiver) handleMetrics(w http.ResponseWriter, req *http.Request) {
+	started := time.Now()
 	exportReq := &collectmetricsv1.ExportMetricsServiceRequest{}
 	if err := unmarshalOTLP(req, exportReq); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -271,6 +258,8 @@ func (r *Receiver) handleMetrics(w http.ResponseWriter, req *http.Request) {
 	points := convertMetrics(exportReq)
 	if len(points) > 0 {
 		r.consumer.AddMetrics(points)
+		log.Printf("ingest: metrics accepted %d point(s) in %s",
+			len(points), time.Since(started).Round(time.Millisecond))
 	}
 
 	w.Header().Set("Content-Type", "application/json")
