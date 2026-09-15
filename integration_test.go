@@ -8,6 +8,7 @@ import (
 	"math"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -55,7 +56,9 @@ func startTestServer(t *testing.T) (string, *writer.Writer, func()) {
 
 	cleanup := func() {
 		r.Stop(context.Background())
-		w.Stop()
+		if err := w.Stop(); err != nil {
+			t.Errorf("final flush: %v", err)
+		}
 		os.RemoveAll(dataDir)
 	}
 
@@ -471,5 +474,133 @@ func TestNonFiniteFloatsAreSanitized(t *testing.T) {
 	// The actual regression: the default output format must not fail.
 	if err := cli.FormatResults(io.Discard, results, columns, "json"); err != nil {
 		t.Errorf("--format json failed on non-finite input: %v", err)
+	}
+}
+
+// --- writer durability regression tests ---
+
+func testSpan() writer.TraceSpan {
+	now := time.Now()
+	return writer.TraceSpan{
+		TraceID: "t", SpanID: "s", ServiceName: "svc", SpanName: "op",
+		StartTime: now.UnixMicro(), EndTime: now.UnixMicro(), DurationMs: 1,
+		StatusCode: "STATUS_CODE_OK", Attributes: "{}",
+		ResourceAttributes: "{}", Events: "[]", Links: "[]",
+	}
+}
+
+func spanCount(t *testing.T, dir string) int {
+	t.Helper()
+	engine, err := query.Open(dir)
+	if err != nil {
+		t.Fatalf("opening query engine: %v", err)
+	}
+	defer engine.Close()
+	rows, _, err := engine.Query("SELECT count(*) AS c FROM traces")
+	if err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	return int(rows[0]["c"].(int64))
+}
+
+// blockedDir makes writes to a signal fail by putting a regular file where the
+// signal directory needs to be, returning a func that unblocks it.
+func blockedDir(t *testing.T, dir, signal string) func() {
+	t.Helper()
+	path := filepath.Join(dir, signal)
+	if err := os.WriteFile(path, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return func() { os.Remove(path) }
+}
+
+// TestFlushFailureRetriesInsteadOfDropping covers a data-loss bug: Flush took
+// the buffers and cleared them before writing, so a failed write discarded
+// everything buffered. Records must survive and be written by a later flush.
+func TestFlushFailureRetriesInsteadOfDropping(t *testing.T) {
+	dir := t.TempDir()
+	unblock := blockedDir(t, dir, "traces")
+
+	w := writer.New(dir, time.Hour, 1000)
+	w.Add([]writer.TraceSpan{testSpan(), testSpan(), testSpan()})
+
+	if err := w.Flush(); err == nil {
+		t.Fatal("expected the first flush to fail")
+	}
+
+	unblock()
+	if err := w.Flush(); err != nil {
+		t.Fatalf("retry flush: %v", err)
+	}
+	if got := spanCount(t, dir); got != 3 {
+		t.Errorf("after a failed flush and a retry, %d spans stored, want 3", got)
+	}
+}
+
+// TestFlushIsAtomic verifies writes land via rename, leaving no partial or
+// temporary file behind. A truncated .parquet is silently reported as zero
+// rows by DuckDB, so it would hide data loss rather than surface it.
+func TestFlushIsAtomic(t *testing.T) {
+	dir := t.TempDir()
+	w := writer.New(dir, time.Hour, 1000)
+	w.Add([]writer.TraceSpan{testSpan()})
+	if err := w.Flush(); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+
+	var files []string
+	err := filepath.Walk(dir, func(p string, info os.FileInfo, err error) error {
+		if err != nil || info.IsDir() {
+			return err
+		}
+		files = append(files, filepath.Base(p))
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walking %s: %v", dir, err)
+	}
+	if len(files) != 1 {
+		t.Errorf("expected exactly 1 committed file, got %d: %v", len(files), files)
+	}
+	for _, f := range files {
+		if strings.HasPrefix(f, ".") {
+			t.Errorf("temporary file left behind: %s", f)
+		}
+	}
+}
+
+// TestFlushErrorsAreReported verifies background flush failures reach OnError.
+// Previously Add() and the ticker discarded Flush's error, so a writer that
+// could not write anything looked healthy indefinitely.
+func TestFlushErrorsAreReported(t *testing.T) {
+	dir := t.TempDir()
+	blockedDir(t, dir, "traces")
+
+	w := writer.New(dir, 10*time.Millisecond, 1000)
+	errs := make(chan error, 4)
+	w.OnError(func(err error) { errs <- err })
+	w.Add([]writer.TraceSpan{testSpan()})
+	w.Start()
+	defer w.Stop()
+
+	select {
+	case <-errs:
+	case <-time.After(2 * time.Second):
+		t.Error("no flush error was reported for a persistently failing writer")
+	}
+}
+
+// TestStopReturnsFinalFlushError verifies a failed shutdown flush is not
+// swallowed, since Stop is the last chance to notice lost telemetry.
+func TestStopReturnsFinalFlushError(t *testing.T) {
+	dir := t.TempDir()
+	blockedDir(t, dir, "traces")
+
+	w := writer.New(dir, time.Hour, 1000)
+	w.Add([]writer.TraceSpan{testSpan()})
+	w.Start()
+
+	if err := w.Stop(); err == nil {
+		t.Error("Stop() returned nil despite an unflushable buffer")
 	}
 }
