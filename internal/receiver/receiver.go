@@ -289,7 +289,7 @@ func fillNumberDataPoint(p *writer.MetricPoint, dp *metricsv1.NumberDataPoint) {
 
 	switch v := dp.GetValue().(type) {
 	case *metricsv1.NumberDataPoint_AsDouble:
-		p.ValueDouble = v.AsDouble
+		p.ValueDouble = safeFloat(v.AsDouble)
 	case *metricsv1.NumberDataPoint_AsInt:
 		p.ValueInt = v.AsInt
 		p.ValueDouble = float64(v.AsInt)
@@ -303,13 +303,13 @@ func fillHistogramDataPoint(p *writer.MetricPoint, dp *metricsv1.HistogramDataPo
 	p.Flags = dp.GetFlags()
 	p.Count = dp.GetCount()
 	if dp.Sum != nil {
-		p.Sum = dp.GetSum()
+		p.Sum = safeFloat(dp.GetSum())
 	}
 	if dp.Min != nil {
-		p.Min = dp.GetMin()
+		p.Min = safeFloat(dp.GetMin())
 	}
 	if dp.Max != nil {
-		p.Max = dp.GetMax()
+		p.Max = safeFloat(dp.GetMax())
 	}
 	p.Exemplars = exemplarsToJSON(dp.GetExemplars())
 	b, _ := json.Marshal(dp.GetBucketCounts())
@@ -325,13 +325,13 @@ func fillExpHistogramDataPoint(p *writer.MetricPoint, dp *metricsv1.ExponentialH
 	p.Flags = dp.GetFlags()
 	p.Count = dp.GetCount()
 	if dp.Sum != nil {
-		p.Sum = dp.GetSum()
+		p.Sum = safeFloat(dp.GetSum())
 	}
 	if dp.Min != nil {
-		p.Min = dp.GetMin()
+		p.Min = safeFloat(dp.GetMin())
 	}
 	if dp.Max != nil {
-		p.Max = dp.GetMax()
+		p.Max = safeFloat(dp.GetMax())
 	}
 	p.Exemplars = exemplarsToJSON(dp.GetExemplars())
 
@@ -356,14 +356,14 @@ func fillSummaryDataPoint(p *writer.MetricPoint, dp *metricsv1.SummaryDataPoint)
 	p.Attributes = attributesToJSON(dp.GetAttributes())
 	p.Flags = dp.GetFlags()
 	p.Count = dp.GetCount()
-	p.Sum = dp.GetSum()
+	p.Sum = safeFloat(dp.GetSum())
 
 	if qv := dp.GetQuantileValues(); len(qv) > 0 {
 		var out []map[string]float64
 		for _, q := range qv {
 			out = append(out, map[string]float64{
-				"quantile": q.GetQuantile(),
-				"value":    q.GetValue(),
+				"quantile": safeFloat(q.GetQuantile()),
+				"value":    safeFloat(q.GetValue()),
 			})
 		}
 		b, _ := json.Marshal(out)
@@ -384,7 +384,7 @@ func exemplarsToJSON(exemplars []*metricsv1.Exemplar) string {
 		}
 		switch v := e.GetValue().(type) {
 		case *metricsv1.Exemplar_AsDouble:
-			m["value"] = v.AsDouble
+			m["value"] = safeFloat(v.AsDouble)
 		case *metricsv1.Exemplar_AsInt:
 			m["value"] = v.AsInt
 		}
@@ -559,7 +559,11 @@ func linksToJSON(links []*tracev1.Span_Link) string {
 	return string(b)
 }
 
-// ensure NaN/Inf don't break JSON marshaling
+// safeFloat replaces NaN and ±Inf with 0. OTLP permits these in float fields,
+// but both JSON encoding and the default --format json output reject them
+// ("json: unsupported value: NaN"), and Parquet min/max statistics are
+// undefined for them. Every float read off an OTLP data point goes through
+// here so a single bad measurement cannot poison a whole query.
 func safeFloat(f float64) float64 {
 	if math.IsNaN(f) || math.IsInf(f, 0) {
 		return 0
