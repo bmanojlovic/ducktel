@@ -4,12 +4,14 @@ import (
 	"context"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"math"
 	"net/http"
 	"strings"
+	"time"
 
 	collectlogsv1 "go.opentelemetry.io/proto/otlp/collector/logs/v1"
 	collectmetricsv1 "go.opentelemetry.io/proto/otlp/collector/metrics/v1"
@@ -29,23 +31,43 @@ type Consumer interface {
 	AddMetrics(points []writer.MetricPoint)
 }
 
+// Server tuning. The receiver is unauthenticated by design (OTLP exporters do
+// not send credentials), so these bound the damage a hostile or misconfigured
+// client can do. Timeouts stop one connection from being held open forever
+// (slowloris); maxBodyBytes stops a single request from exhausting memory, since
+// the whole body is buffered before decoding.
+const (
+	readHeaderTimeout = 5 * time.Second
+	readTimeout       = 30 * time.Second
+	writeTimeout      = 60 * time.Second
+	idleTimeout       = 120 * time.Second
+	maxBodyBytes      = 32 << 20 // 32 MiB
+)
+
 type Receiver struct {
 	server   *http.Server
 	consumer Consumer
 }
 
-func New(port int, consumer Consumer) *Receiver {
+// New creates a receiver bound to host:port. Pass an empty host to listen on
+// all interfaces; the serve command passes "localhost" by default so a local
+// developer tool is not silently exposed to the network.
+func New(host string, port int, consumer Consumer) *Receiver {
 	r := &Receiver{consumer: consumer}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v1/traces", r.handleTraces)
 	mux.HandleFunc("POST /v1/logs", r.handleLogs)
 	mux.HandleFunc("POST /v1/metrics", r.handleMetrics)
-	mux.HandleFunc("GET /", r.handleHealth)
+	mux.HandleFunc("GET /health", r.handleHealth)
 
 	r.server = &http.Server{
-		Addr:    fmt.Sprintf(":%d", port),
-		Handler: mux,
+		Addr:              fmt.Sprintf("%s:%d", host, port),
+		Handler:           mux,
+		ReadHeaderTimeout: readHeaderTimeout,
+		ReadTimeout:       readTimeout,
+		WriteTimeout:      writeTimeout,
+		IdleTimeout:       idleTimeout,
 	}
 	return r
 }
@@ -404,9 +426,15 @@ func exemplarsToJSON(exemplars []*metricsv1.Exemplar) string {
 // --- Shared helpers ---
 
 func unmarshalOTLP(req *http.Request, msg proto.Message) error {
-	body, err := io.ReadAll(req.Body)
+	// Cap the body before reading: the request is unauthenticated, so without
+	// this a single client can make the process allocate without limit.
+	body, err := io.ReadAll(http.MaxBytesReader(nil, req.Body, maxBodyBytes))
 	if err != nil {
-		return fmt.Errorf("failed to read body")
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			return fmt.Errorf("request body exceeds %d bytes", maxBodyBytes)
+		}
+		return fmt.Errorf("reading body: %w", err)
 	}
 	defer req.Body.Close()
 
@@ -419,7 +447,7 @@ func unmarshalOTLP(req *http.Request, msg proto.Message) error {
 	default:
 		if err := proto.Unmarshal(body, msg); err != nil {
 			if err2 := protojson.Unmarshal(body, msg); err2 != nil {
-				return fmt.Errorf("unsupported content type")
+				return fmt.Errorf("unsupported content type %q", ct)
 			}
 		}
 		return nil
