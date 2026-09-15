@@ -21,6 +21,7 @@ import (
 
 	"github.com/davidgeorgehope/ducktel/internal/query"
 	"github.com/davidgeorgehope/ducktel/internal/receiver"
+	"github.com/davidgeorgehope/ducktel/internal/testharness"
 	"github.com/davidgeorgehope/ducktel/internal/writer"
 )
 
@@ -307,4 +308,28 @@ func TestMetrics(t *testing.T) {
 
 func ptrFloat64(f float64) *float64 {
 	return &f
+}
+
+// TestPascalCase covers the helper that replaced the deprecated strings.Title.
+// Only the first rune of each hyphen-separated segment is upper-cased, and
+// hyphens are dropped, so "product-service" yields an RPC-style identifier.
+func TestPascalCase(t *testing.T) {
+	cases := map[string]string{
+		"product-service":      "ProductService",
+		"api-gateway":          "ApiGateway",
+		"notification-service": "NotificationService",
+		"single":               "Single",
+		"a-b-c":                "ABC",
+		"":                     "",
+		"-lead":                "Lead",
+		"trail-":               "Trail",
+		"double--dash":         "DoubleDash",
+		"UPPER-case":           "UPPERCase",
+		"örebro-service":       "ÖrebroService",
+	}
+	for in, want := range cases {
+		if got := testharness.PascalCase(in); got != want {
+			t.Errorf("PascalCase(%q) = %q, want %q", in, got, want)
+		}
+	}
 }

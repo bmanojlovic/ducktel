@@ -316,7 +316,7 @@ func (h *Harness) walkService(
 			}
 			if dep.Protocol == "grpc" {
 				clientAttrs["rpc.system"] = "grpc"
-				clientAttrs["rpc.service"] = strings.ReplaceAll(strings.Title(dep.Service), "-", "") + "Service"
+				clientAttrs["rpc.service"] = PascalCase(dep.Service) + "Service"
 				clientAttrs["rpc.method"] = "Process"
 			} else {
 				clientAttrs["http.request.method"] = "GET"
@@ -724,6 +724,24 @@ func formatResourceAttrs(attrs map[string]string) []map[string]interface{} {
 		})
 	}
 	return out
+}
+
+// PascalCase upper-cases the first letter of each hyphen-separated segment and
+// joins them: "product-service" -> "ProductService". Replaces the deprecated
+// strings.Title, whose Unicode word-boundary rules do not match this intent.
+func PascalCase(s string) string {
+	parts := strings.Split(s, "-")
+	var b strings.Builder
+	b.Grow(len(s))
+	for _, p := range parts {
+		if p == "" {
+			continue
+		}
+		r := []rune(p)
+		b.WriteString(strings.ToUpper(string(r[0])))
+		b.WriteString(string(r[1:]))
+	}
+	return b.String()
 }
 
 func randomHex(byteLen int) string {
