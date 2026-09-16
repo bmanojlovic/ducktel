@@ -68,9 +68,14 @@ func (s *Server) Register(srv *sdkmcp.Server) {
 	sdkmcp.AddTool(srv, &sdkmcp.Tool{
 		Name: "metric_query",
 		Description: "Aggregate a metric over a time range, optionally grouped by a column. " +
-			"Use this for numeric questions — request rates, latency percentiles, resource " +
-			"utilisation — rather than fetching raw points. Supports avg, sum, min, max, " +
-			"count and percentiles.",
+			"Use this for numeric questions — request rates, resource utilisation, " +
+			"min/avg/max of a recorded value — rather than fetching raw points. " +
+			"Supports avg, sum, min, max, count and percentiles. " +
+			"IMPORTANT for senders: this aggregates the value_double column, which is " +
+			"only populated for gauge and sum points. A histogram point stores its data " +
+			"in sum/min/max/count/bucket_counts instead and is therefore INVISIBLE here " +
+			"— it returns 0 rather than an error. Send a per-event duration or size as a " +
+			"gauge or sum, not a histogram, or it will not be aggregatable.",
 	}, s.metricQuery)
 
 	// Only offered when a flush endpoint is configured: without one the tool
