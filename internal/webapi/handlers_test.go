@@ -36,6 +36,12 @@ func newTestMux(t *testing.T, token string) *http.ServeMux {
 		seedSpan("worker", "acme", "trace-acme-2"),
 		seedSpan("api", "globex", "trace-globex-1"),
 	})
+	w.AddMetrics([]writer.MetricPoint{
+		{MetricName: "cpu.util", MetricType: "gauge", Timestamp: time.Now().UnixMicro(),
+			ValueDouble: 0.5, ResourceAttributes: `{"tenant.id":"acme"}`},
+		{MetricName: "cpu.util", MetricType: "gauge", Timestamp: time.Now().UnixMicro(),
+			ValueDouble: 0.9, ResourceAttributes: `{"tenant.id":"globex"}`},
+	})
 	if err := w.Flush(); err != nil {
 		t.Fatalf("seeding: %v", err)
 	}
@@ -161,6 +167,29 @@ func TestListServicesScopedToTenant(t *testing.T) {
 	json.Unmarshal(rec.Body.Bytes(), &resp)
 	if len(resp.Rows) != 2 {
 		t.Errorf("acme services = %d, want 2 (api, worker)", len(resp.Rows))
+	}
+}
+
+func TestListMetricNamesScopedToTenant(t *testing.T) {
+	mux := newTestMux(t, "")
+
+	rec := doReq(t, mux, "GET", "/api/metric-names?tenant=acme", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d: %s", rec.Code, rec.Body.String())
+	}
+	var resp rowsResponse
+	json.Unmarshal(rec.Body.Bytes(), &resp)
+	if len(resp.Rows) != 1 || resp.Rows[0]["metric_name"] != "cpu.util" {
+		t.Errorf("acme metric names = %v, want exactly [cpu.util]", resp.Rows)
+	}
+}
+
+func TestListMetricNamesMissingTenantIs400(t *testing.T) {
+	mux := newTestMux(t, "")
+
+	rec := doReq(t, mux, "GET", "/api/metric-names", "")
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400: %s", rec.Code, rec.Body.String())
 	}
 }
 
