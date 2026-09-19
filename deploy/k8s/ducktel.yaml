@@ -163,8 +163,11 @@ spec:
               memory: 64Mi
             limits:
               # Querying opens DuckDB over the parquet files; bound it so a
-              # large aggregation cannot take the node down.
-              memory: 1Gi
+              # large aggregation cannot take the node down. Bumped from 1Gi
+              # after an observed OOMKill (exit 137) during normal use — the
+              # real fix is retention (bounds how much a scan can touch at
+              # all), not just a bigger ceiling, but this buys headroom now.
+              memory: 2Gi
           volumeMounts:
             # Read-only: the MCP container never writes, which also makes it
             # impossible for a query path to corrupt stored telemetry.
