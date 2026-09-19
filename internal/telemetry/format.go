@@ -1,18 +1,19 @@
-package mcp
+package telemetry
 
 import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"math"
 )
 
-// marshalRows renders query results as indented JSON, preserving column order.
+// MarshalRows renders query results as indented JSON, preserving column order.
 //
 // ducktel's engine returns rows as maps, which lose column order, so the order
 // it separately reports is used to rebuild each row. Go's encoding/json sorts
 // map keys, which would otherwise present columns alphabetically rather than in
 // the order the query asked for.
-func marshalRows(rows []map[string]any, cols []string) (string, error) {
+func MarshalRows(rows []map[string]any, cols []string) (string, error) {
 	if len(rows) == 0 {
 		return "[]", nil
 	}
@@ -46,4 +47,19 @@ func marshalRows(rows []map[string]any, cols []string) (string, error) {
 	}
 	buf.WriteString("\n]")
 	return buf.String(), nil
+}
+
+// SanitizeRows replaces non-finite float64 values (NaN/Inf, which can appear in
+// metric aggregates) with nil in place, so callers that marshal rows directly
+// with encoding/json — rather than through MarshalRows's per-cell degradation —
+// do not fail an entire response over one bad value.
+func SanitizeRows(rows []map[string]any) []map[string]any {
+	for _, row := range rows {
+		for k, v := range row {
+			if f, ok := v.(float64); ok && (math.IsNaN(f) || math.IsInf(f, 0)) {
+				row[k] = nil
+			}
+		}
+	}
+	return rows
 }
