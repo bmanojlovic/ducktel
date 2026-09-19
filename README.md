@@ -174,10 +174,26 @@ ducktel saved delete "payment-errors"
 Start the OTLP receiver.
 
 ```bash
-ducktel serve [--port 4318] [--flush-interval 30s] [--data-dir ./data]
+ducktel serve [--host localhost] [--port 4318] [--flush-interval 30s] [--data-dir ./data]
+ducktel serve --host 0.0.0.0 --auth-token "$DUCKTEL_AUTH_TOKEN"   # network-exposed, authenticated
 ```
 
-Accepts `POST /v1/traces`, `POST /v1/logs`, `POST /v1/metrics` — protobuf and JSON.
+Accepts `POST /v1/traces`, `POST /v1/logs`, `POST /v1/metrics` — protobuf and JSON. Also serves `GET /health` (always unauthenticated, for liveness/readiness probes) and `POST /flush` (forces an immediate flush of buffered records; see Authentication below).
+
+Binds to `localhost` by default, so a local developer instance isn't silently exposed to the network — pass `--host 0.0.0.0` for containers/VMs.
+
+#### Authentication
+
+Disabled unless a token is configured. OTLP carries no credentials in the message body — auth is transport-level per spec — so senders present it as a header:
+
+```bash
+ducktel serve --host 0.0.0.0 --auth-token "$DUCKTEL_AUTH_TOKEN"
+
+# any OTel SDK/collector supports this via one env var, no instrumentation changes needed
+export OTEL_EXPORTER_OTLP_HEADERS="Authorization=Bearer $DUCKTEL_AUTH_TOKEN"
+```
+
+`POST /flush` takes a **separate** token (`--flush-token` / `DUCKTEL_FLUSH_TOKEN`, falling back to `DUCKTEL_MCP_TOKEN`): it's a control action requested by the query side, not a data-ingest action, so the process that queries can trigger a flush without ever holding the write token. If the token would cross an untrusted network, put a TLS-terminating proxy in front — ducktel does not terminate TLS itself.
 
 ### `ducktel query`
 
@@ -236,6 +252,32 @@ ducktel saved run-all
 ducktel saved delete <name>
 ```
 
+### `ducktel mcp`
+
+Serve telemetry queries over the Model Context Protocol, for agent consumers that speak MCP instead of shelling out to the CLI.
+
+```bash
+ducktel mcp --data-dir /data                          # stdio (default) — process boundary is the trust boundary
+ducktel mcp --http --host 0.0.0.0 --port 4319 \
+  --auth-token "$DUCKTEL_MCP_TOKEN" \
+  --flush-url http://localhost:4318/flush              # network-exposed, authenticated
+```
+
+Four generic, domain-agnostic tools:
+
+| Tool | Purpose |
+|------|---------|
+| `trace_lookup(trace_id, tenant)` | every span of one trace, ordered by start time |
+| `span_search(filters, service_name, since_minutes, tenant, limit)` | spans matching attribute key/value filters |
+| `metric_query(metric_name, aggregation, since_minutes, group_by, tenant)` | metric aggregation: avg, sum, min, max, count, p50, p95, p99 |
+| `flush_buffer()` | make just-received telemetry queryable now (only advertised when `--flush-url` is set) |
+
+**`tenant` is required on every query tool** — it's in the JSON schema, so a client cannot omit it — and every query hard-filters on the `tenant.id` resource attribute. A caller can narrow its scope but never widen it.
+
+**The MCP token is a separate secret from the OTLP token.** `DUCKTEL_AUTH_TOKEN` grants write (OTLP ingest, held by senders); `DUCKTEL_MCP_TOKEN` grants read (MCP queries, and `POST /flush`, held by consumers). A compromised sender must not gain read access to every tenant, and a read token must not be able to forge telemetry — so use a different value for each. In HTTP mode, `--auth-token` is required; ducktel refuses to start without one rather than silently exposing every tenant's data.
+
+See [`skills/ducktel/SKILL.md`](skills/ducktel/SKILL.md) for the full reference, including flush-latency semantics and dotted-attribute-key gotchas.
+
 ### `ducktel testdata`
 
 Generate synthetic OTLP telemetry for testing.
@@ -268,6 +310,9 @@ exporters:
     endpoint: http://localhost:4318
     tls:
       insecure: true
+    # only needed if the receiver was started with --auth-token
+    headers:
+      Authorization: "Bearer ${DUCKTEL_AUTH_TOKEN}"
 
 service:
   pipelines:
@@ -402,7 +447,7 @@ That's ducktel. Single binary. No platform. No vendor. No lock-in.
 
 ## Status
 
-Early stage. The core ingest → store → query → saved queries loop works. Built-in test harness for generating synthetic data. Contributions welcome.
+The core ingest → store → query → saved queries loop works, plus bearer-token auth on both the OTLP and MCP endpoints and an MCP server for agent consumers with mandatory per-tenant isolation. Built-in test harness for generating synthetic data. A Containerfile and example Kubernetes manifests (`deploy/k8s/`) are included for running it as a service rather than a local binary. There is currently no retention or compaction — Parquet files accumulate indefinitely. Contributions welcome.
 
 ## License
 
