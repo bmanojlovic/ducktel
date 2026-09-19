@@ -78,6 +78,11 @@ spec:
 # MCP over the public hostname, so a workstation can consume it with a
 # publicly-trusted certificate and no CA installation.
 #
+# This route has no path restriction, so it also carries the dashboard SPA
+# (/dashboard) and its REST API (/api/*) once the mcp container is started
+# with --dashboard — same mux, same port, same token, so no separate
+# IngressRoute or Service was needed for it.
+#
 # This endpoint reads EVERY tenant with one bearer token, so it is the most
 # sensitive surface ducktel exposes: the token is the whole boundary. Traefik
 # terminates TLS and forwards plain HTTP to the ClusterIP service.
