@@ -16,10 +16,11 @@ type Writer struct {
 	flushInterval time.Duration
 	bufferSize    int
 
-	mu      sync.Mutex
-	traces  []TraceSpan
-	logs    []LogRecord
-	metrics []MetricPoint
+	mu        sync.Mutex
+	traces    []TraceSpan
+	logs      []LogRecord
+	metrics   []MetricPoint
+	retention time.Duration // 0 disables; guarded by mu, see SetRetention
 
 	// onError, if set, is called for flush failures that happen on the
 	// background ticker or at shutdown. Those paths have no caller to return
@@ -46,6 +47,16 @@ func (w *Writer) OnError(fn func(error)) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	w.onError = fn
+}
+
+// SetRetention enables a periodic sweep that deletes whole date-partition
+// directories older than d. Zero (the default) disables it: data
+// accumulates indefinitely unless this is called with a positive duration.
+// Must be called before Start for the background ticker to pick it up.
+func (w *Writer) SetRetention(d time.Duration) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.retention = d
 }
 
 func (w *Writer) report(err error) {
@@ -261,15 +272,39 @@ func nextPath(dir string, now time.Time) (string, error) {
 	}
 }
 
+// retentionCheckInterval is fixed regardless of flush-interval: pruning is
+// day-granular, so checking hourly is more than enough and keeps retention
+// independent of how aggressively flush-interval happens to be tuned.
+const retentionCheckInterval = time.Hour
+
 func (w *Writer) Start() {
 	go func() {
 		defer close(w.done)
 		ticker := time.NewTicker(w.flushInterval)
 		defer ticker.Stop()
+
+		// A nil channel blocks forever in a select, so retention simply never
+		// fires when disabled — no separate enabled/disabled branching needed
+		// in the loop below.
+		var retentionCh <-chan time.Time
+		w.mu.Lock()
+		enabled := w.retention > 0
+		w.mu.Unlock()
+		if enabled {
+			retentionTicker := time.NewTicker(retentionCheckInterval)
+			defer retentionTicker.Stop()
+			retentionCh = retentionTicker.C
+			// Sweep once at startup too, so a long-stopped process does not
+			// wait a full hour before catching up on backlog.
+			w.report(w.pruneOldData())
+		}
+
 		for {
 			select {
 			case <-ticker.C:
 				w.report(w.Flush())
+			case <-retentionCh:
+				w.report(w.pruneOldData())
 			case <-w.stopCh:
 				w.report(w.Flush())
 				return

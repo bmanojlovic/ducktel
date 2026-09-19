@@ -41,6 +41,7 @@ ducktel serve --host 0.0.0.0           # all interfaces (containers)
 ducktel serve --flush-interval 10s     # flush every 10 seconds
 ducktel serve --auth-token secret      # require a bearer token on OTLP ingest
 ducktel serve --flush-token secret2    # ...and a different one on POST /flush
+ducktel serve --retention 30d          # delete date-partition directories older than 30 days
 ```
 
 Endpoints: `POST /v1/traces`, `POST /v1/logs`, `POST /v1/metrics`, `GET /health`,
@@ -77,6 +78,27 @@ export OTEL_EXPORTER_OTLP_HEADERS="Authorization=Bearer secret"
   request/response rather than a persistent connection, so a terminating proxy is
   a natural fit.
 - Starting without a token while bound to a non-loopback address logs a warning.
+
+#### Retention
+
+Off by default — Parquet files accumulate indefinitely unless `--retention` is
+set. When set, an hourly background sweep deletes whole `traces|logs|metrics/
+YYYY-MM-DD` directories older than the window:
+
+```bash
+ducktel serve --retention 30d     # bare day count
+ducktel serve --retention 720h    # or any Go duration
+```
+
+- Day-granular, not per-record: a directory is either kept whole or removed
+  whole. There is no compaction of what's kept and no partial-day pruning.
+- A directory name that doesn't parse as `YYYY-MM-DD` is left alone rather
+  than guessed at.
+- Runs once immediately on startup (so a long-stopped process catches up on
+  backlog) and then hourly, independent of `--flush-interval`.
+- Deletions are logged individually (`retention: removed <path> (older than
+  <window>)`), so what got pruned and when is always visible in the process
+  log, not silent.
 
 ### `ducktel query [sql]`
 
@@ -154,8 +176,10 @@ but never widen it. `flush_buffer` takes no arguments and touches no data.
 quotes the key internally, because DuckDB treats `$.service.name` as field "service"
 then "name" and silently returns NULL. See the note under SQL Query Patterns.
 
-**Time windows default to 60 minutes.** Pass `since_minutes` for a wider range. There is
-no retention or pruning in ducktel, so unbounded scans would otherwise read all history.
+**Time windows default to 60 minutes.** Pass `since_minutes` for a wider range. Retention
+(see `ducktel serve --retention` above) is off unless explicitly configured, and even
+when on only prunes whole old days — it does not bound how far back an unfiltered scan
+within the retained window can read, so a wide `since_minutes` can still be expensive.
 
 #### Two transports, two trust domains
 

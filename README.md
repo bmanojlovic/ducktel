@@ -176,6 +176,7 @@ Start the OTLP receiver.
 ```bash
 ducktel serve [--host localhost] [--port 4318] [--flush-interval 30s] [--data-dir ./data]
 ducktel serve --host 0.0.0.0 --auth-token "$DUCKTEL_AUTH_TOKEN"   # network-exposed, authenticated
+ducktel serve --retention 30d                                     # delete date-partitions older than 30 days
 ```
 
 Accepts `POST /v1/traces`, `POST /v1/logs`, `POST /v1/metrics` — protobuf and JSON. Also serves `GET /health` (always unauthenticated, for liveness/readiness probes) and `POST /flush` (forces an immediate flush of buffered records; see Authentication below).
@@ -341,6 +342,8 @@ data/
 
 Date-partitioned Parquet files. DuckDB reads them via glob at query time. Nothing is dropped — all OTLP fields are preserved. Your data is never trapped in a proprietary format.
 
+Retention is off by default (files accumulate forever) and day-granular when enabled: `ducktel serve --retention 30d` runs an hourly background sweep that deletes whole `YYYY-MM-DD` directories older than the window — no partial-day deletion, no compaction of what's kept. A date-shaped directory older than the cutoff is removed in full; anything else under a signal directory is left alone.
+
 ## Schemas
 
 <details>
@@ -447,7 +450,7 @@ That's ducktel. Single binary. No platform. No vendor. No lock-in.
 
 ## Status
 
-The core ingest → store → query → saved queries loop works, plus bearer-token auth on both the OTLP and MCP endpoints and an MCP server for agent consumers with mandatory per-tenant isolation. Built-in test harness for generating synthetic data. A Containerfile and example Kubernetes manifests (`deploy/k8s/`) are included for running it as a service rather than a local binary. There is currently no retention or compaction — Parquet files accumulate indefinitely. Contributions welcome.
+The core ingest → store → query → saved queries loop works, plus bearer-token auth on both the OTLP and MCP endpoints and an MCP server for agent consumers with mandatory per-tenant isolation. Built-in test harness for generating synthetic data. A Containerfile and example Kubernetes manifests (`deploy/k8s/`) are included for running it as a service rather than a local binary. Retention is day-granular and off by default — `ducktel serve --retention 30d` deletes whole date-partition directories older than the window; there is still no compaction within a retained day. Contributions welcome.
 
 ## License
 
