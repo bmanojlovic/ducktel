@@ -2,8 +2,9 @@
 //
 // Talks to the REST API in internal/webapi, which wraps the exact same
 // internal/telemetry.Core the MCP tools use. Auth reuses the same read
-// token as the MCP server: entered once here, kept in sessionStorage (not
-// localStorage, so closing the tab clears it), sent as a Bearer header on
+// token as the MCP server: entered once here, kept in localStorage (so it
+// survives closing the tab/browser — a deliberate convenience-over-exposure
+// tradeoff; a 401 still clears it immediately), sent as a Bearer header on
 // every /api/* call.
 
 const TOKEN_KEY = "ducktel_token";
@@ -44,15 +45,15 @@ function setHash(view, params) {
 // --- token / auth ---
 
 function getToken() {
-  return sessionStorage.getItem(TOKEN_KEY) || "";
+  return localStorage.getItem(TOKEN_KEY) || "";
 }
 
 function setToken(t) {
-  sessionStorage.setItem(TOKEN_KEY, t);
+  localStorage.setItem(TOKEN_KEY, t);
 }
 
 function clearToken() {
-  sessionStorage.removeItem(TOKEN_KEY);
+  localStorage.removeItem(TOKEN_KEY);
 }
 
 // api issues an authenticated request to /api/*. On 401 it clears the stored
@@ -435,6 +436,19 @@ async function runFlush() {
   }
 }
 
+// --- logout ---
+//
+// The token now persists in localStorage (see the top-of-file note), so
+// there needs to be an explicit way to forget it — otherwise the only way to
+// clear a stored token is a 401 or manually clearing browser storage.
+function logout() {
+  clearToken();
+  state.tenant = null;
+  state.tenants = [];
+  state.connected = false;
+  showGate();
+}
+
 // --- misc ---
 
 function escapeHtml(s) {
@@ -560,6 +574,7 @@ function init() {
     runMetricQuery();
   });
   document.getElementById("flush-btn").addEventListener("click", runFlush);
+  document.getElementById("logout-btn").addEventListener("click", logout);
 
   // A pasted deep link or back/forward navigation while already connected
   // should re-apply, not sit ignored. setHash uses replaceState (no event),
@@ -569,7 +584,8 @@ function init() {
     if (state.connected) applyInitialView();
   });
 
-  // If a token is already stored (same tab, page reload), skip the gate.
+  // If a token is already stored (persists across tabs/restarts now — see
+  // the top-of-file note on localStorage), skip the gate.
   if (getToken()) {
     connect();
   } else {
