@@ -112,6 +112,8 @@ async function resolveTenant() {
   select.onchange = () => {
     state.tenant = select.value;
     loadServices();
+    loadMetricNames();
+    runTraceSearch();
   };
 }
 
@@ -128,6 +130,26 @@ async function loadServices() {
   select.innerHTML = `<option value="">any</option>` + services
     .map((s) => `<option value="${escapeHtml(s)}">${escapeHtml(s)}</option>`)
     .join("");
+}
+
+// --- metric names (for the metrics form dropdown) ---
+//
+// metric_query matches metric_name exactly, and there was previously no way
+// to discover what's actually been ingested short of guessing — this closes
+// that gap the same way loadServices does for the traces filter.
+async function loadMetricNames() {
+  const select = document.getElementById("m-name");
+  if (!state.tenant) {
+    select.innerHTML = `<option value="">-- select --</option>`;
+    return;
+  }
+  const resp = await api("/api/metric-names?tenant=" + encodeURIComponent(state.tenant));
+  const names = resp.rows.map((r) => r.metric_name).filter(Boolean);
+  const current = select.value;
+  select.innerHTML = `<option value="">-- select --</option>` + names
+    .map((n) => `<option value="${escapeHtml(n)}">${escapeHtml(n)}</option>`)
+    .join("");
+  if (names.includes(current)) select.value = current;
 }
 
 // --- config (flush button visibility) ---
@@ -291,9 +313,14 @@ async function runMetricQuery() {
     toast("no tenant selected — send some telemetry first", true);
     return;
   }
+  const metricName = document.getElementById("m-name").value;
+  if (!metricName) {
+    toast("choose a metric name first", true);
+    return;
+  }
   const params = new URLSearchParams();
   params.set("tenant", state.tenant);
-  params.set("metric_name", document.getElementById("m-name").value.trim());
+  params.set("metric_name", metricName);
   params.set("aggregation", document.getElementById("m-agg").value);
   params.set("since_minutes", document.getElementById("m-since").value || "60");
   const groupBy = document.getElementById("m-groupby").value.trim();
@@ -375,7 +402,14 @@ async function connect() {
   }
   hideGate();
   await loadServices();
+  await loadMetricNames();
   await loadConfig();
+  // Auto-load so the first thing you see isn't an empty table — but only if
+  // there's actually a tenant to query; on a fresh install with zero data
+  // yet, an immediate "no tenant" toast would just be noise.
+  if (state.tenant) {
+    await runTraceSearch();
+  }
 }
 
 function initGate() {

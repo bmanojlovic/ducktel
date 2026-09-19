@@ -421,6 +421,27 @@ func TestListServicesRequiresTenant(t *testing.T) {
 	}
 }
 
+func TestListMetricNames(t *testing.T) {
+	c := newTestCore(t)
+
+	rows, _, err := c.ListMetricNames("acme")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(rows) != 1 || rows[0]["metric_name"].(string) != "cpu.util" {
+		t.Errorf("ListMetricNames(acme) = %v, want exactly [cpu.util]", rows)
+	}
+}
+
+func TestListMetricNamesRequiresTenant(t *testing.T) {
+	c := newTestCore(t)
+
+	_, _, err := c.ListMetricNames("")
+	if err == nil {
+		t.Error("ListMetricNames without tenant should error")
+	}
+}
+
 // --- tenant attribute contract ---
 
 func TestTenantAttributeName(t *testing.T) {

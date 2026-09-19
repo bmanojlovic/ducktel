@@ -236,3 +236,15 @@ func (c *Core) ListServices(tenant string) ([]map[string]any, []string, error) {
 	q := `SELECT DISTINCT service_name FROM traces WHERE ` + c.tenantPredicate() + ` ORDER BY 1`
 	return c.engine.Query(q, tenant)
 }
+
+// ListMetricNames returns distinct metric names within one tenant. Like
+// ListServices, no MCP tool needs this — an agent caller already knows the
+// metric name it wants — but a human-facing consumer has no way to guess an
+// exact metric_name string without seeing what's actually been ingested.
+func (c *Core) ListMetricNames(tenant string) ([]map[string]any, []string, error) {
+	if err := validateTenant(tenant); err != nil {
+		return nil, nil, err
+	}
+	q := `SELECT DISTINCT metric_name FROM metrics WHERE ` + c.tenantPredicate() + ` ORDER BY 1`
+	return c.engine.Query(q, tenant)
+}

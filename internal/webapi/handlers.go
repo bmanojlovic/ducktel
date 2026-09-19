@@ -42,6 +42,7 @@ func (h *Handlers) Register(mux *http.ServeMux) {
 	mux.Handle("GET /api/metrics", auth(h.handleQueryMetric))
 	mux.Handle("GET /api/tenants", auth(h.handleListTenants))
 	mux.Handle("GET /api/services", auth(h.handleListServices))
+	mux.Handle("GET /api/metric-names", auth(h.handleListMetricNames))
 	mux.Handle("POST /api/flush", auth(h.handleFlush))
 	mux.Handle("GET /api/config", auth(h.handleConfig))
 }
@@ -149,6 +150,15 @@ func (h *Handlers) handleListTenants(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handlers) handleListServices(w http.ResponseWriter, r *http.Request) {
 	rows, cols, err := h.core.ListServices(r.URL.Query().Get("tenant"))
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeRows(w, rows, cols)
+}
+
+func (h *Handlers) handleListMetricNames(w http.ResponseWriter, r *http.Request) {
+	rows, cols, err := h.core.ListMetricNames(r.URL.Query().Get("tenant"))
 	if err != nil {
 		writeErr(w, err)
 		return
