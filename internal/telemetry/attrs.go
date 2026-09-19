@@ -1,10 +1,9 @@
-// Package mcp exposes ducktel's stored telemetry over the Model Context
-// Protocol as a small set of generic, domain-agnostic query tools.
-//
-// The tools are deliberately generic: they know about traces, spans, metrics,
-// attributes and time, and nothing about what any attribute means. Domain
-// interpretation belongs to the caller.
-package mcp
+// Package telemetry holds the query logic shared by every consumer of
+// ducktel's stored data — the MCP tools and the dashboard REST API today,
+// potentially something else later. It knows about traces, spans, metrics,
+// attributes and tenants, and nothing about MCP or HTTP: those are transport
+// concerns layered on top by their respective packages.
+package telemetry
 
 import (
 	"sort"
