@@ -21,6 +21,7 @@ func serveCmd() *cobra.Command {
 		flushInterval time.Duration
 		token         string
 		flushToken    string
+		retention     string
 	)
 
 	cmd := &cobra.Command{
@@ -34,8 +35,18 @@ Authentication is disabled unless a token is configured. Set it with
 OTEL_EXPORTER_OTLP_HEADERS. /health stays unauthenticated for probes.
 
 TLS is not terminated here — front the receiver with a proxy or ingress if the
-token would cross an untrusted network.`,
+token would cross an untrusted network.
+
+--retention deletes whole date-partition directories older than the given
+window (accepts Go durations like 720h, or a bare day count like 30d). Empty
+(the default) disables it, so upgrading an existing deployment never starts
+deleting data without an explicit opt-in.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			retentionDur, err := writer.ParseRetention(retention)
+			if err != nil {
+				return err
+			}
+
 			// Env wins only when the flag was not given, so an explicit flag
 			// can always override the environment.
 			if !cmd.Flags().Changed("auth-token") {
@@ -64,6 +75,9 @@ token would cross an untrusted network.`,
 			w.OnError(func(err error) {
 				log.Printf("writer error: %v", err)
 			})
+			if retentionDur > 0 {
+				w.SetRetention(retentionDur)
+			}
 			w.Start()
 
 			// Log the effective configuration once at startup: without it the
@@ -72,8 +86,12 @@ token would cross an untrusted network.`,
 			if token != "" {
 				authState = "enabled"
 			}
-			log.Printf("starting: data-dir=%s flush-interval=%s auth=%s",
-				dataDir, flushInterval, authState)
+			retentionState := "disabled (keep forever)"
+			if retentionDur > 0 {
+				retentionState = retentionDur.String()
+			}
+			log.Printf("starting: data-dir=%s flush-interval=%s auth=%s retention=%s",
+				dataDir, flushInterval, authState, retentionState)
 
 			r := receiver.New(host, port, w, token, flushToken, w.Flush)
 
@@ -127,6 +145,7 @@ token would cross an untrusted network.`,
 	cmd.Flags().DurationVar(&flushInterval, "flush-interval", 30*time.Second, "How often to flush buffered spans to disk")
 	cmd.Flags().StringVar(&token, "auth-token", "", "Require this bearer token on OTLP endpoints (env: DUCKTEL_AUTH_TOKEN)")
 	cmd.Flags().StringVar(&flushToken, "flush-token", "", "Require this bearer token on POST /flush (env: DUCKTEL_FLUSH_TOKEN, or DUCKTEL_MCP_TOKEN)")
+	cmd.Flags().StringVar(&retention, "retention", "", "Delete date-partition directories older than this (e.g. 30d, 720h); empty disables retention (default: keep forever)")
 
 	return cmd
 }
