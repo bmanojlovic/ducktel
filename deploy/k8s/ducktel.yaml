@@ -126,6 +126,10 @@ spec:
             # writer accepts on /flush — so this container can trigger a flush
             # but never holds write access.
             - http://localhost:4318/flush
+            # Human-facing dashboard + REST API, same mux/port/token as the
+            # MCP server above — one more transport onto identical query
+            # logic, not a second trust domain, so no new Secret is needed.
+            - --dashboard
           ports:
             - name: mcp-http
               containerPort: 4319
