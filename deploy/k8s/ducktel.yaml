@@ -45,7 +45,7 @@ spec:
         - name: otlp
           # Pinned to an immutable tag: a mutable tag let a pod start on a
           # stale build (the earlier `unknown flag: --http` crashloop).
-          image: ghcr.io/bmanojlovic/ducktel:sha-e374a34
+          image: ghcr.io/bmanojlovic/ducktel:sha-7d1a4df
           imagePullPolicy: IfNotPresent
           args:
             - serve
@@ -107,7 +107,7 @@ spec:
         - name: mcp
           # Pinned to an immutable tag: a mutable tag let a pod start on a
           # stale build (the earlier `unknown flag: --http` crashloop).
-          image: ghcr.io/bmanojlovic/ducktel:sha-e374a34
+          image: ghcr.io/bmanojlovic/ducktel:sha-7d1a4df
           imagePullPolicy: IfNotPresent
           args:
             - mcp
