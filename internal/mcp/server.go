@@ -3,10 +3,6 @@ package mcp
 import (
 	"context"
 	"fmt"
-	"io"
-	"net/http"
-	"strings"
-	"time"
 
 	sdkmcp "github.com/modelcontextprotocol/go-sdk/mcp"
 
@@ -25,27 +21,16 @@ import (
 // allowlist — lives in internal/telemetry, shared with the dashboard REST API.
 // This type only adapts MCP's argument/result shapes onto that shared core.
 type Server struct {
-	core *telemetry.Core
-	// flushURL, when set, is the writer's POST /flush endpoint. The query side
-	// asks the writer to make buffered records durable, because this process
-	// reads Parquet files and cannot see data still in the writer's memory.
-	flushURL string
-	// flushToken authorises that request. It is the query side's own token,
-	// never the ingest token — so this process can ask for a flush but can
-	// never write telemetry.
-	flushToken string
-	// httpClient issues the flush request.
-	httpClient *http.Client
+	core    *telemetry.Core
+	flusher *telemetry.Flusher
 }
 
 // NewServer wires the query engine into an MCP server. An empty flushURL
 // disables the flush tool.
 func NewServer(engine *query.Engine, flushURL, flushToken string) *Server {
 	return &Server{
-		core:       telemetry.NewCore(engine),
-		flushURL:   flushURL,
-		flushToken: flushToken,
-		httpClient: &http.Client{Timeout: 30 * time.Second},
+		core:    telemetry.NewCore(engine),
+		flusher: telemetry.NewFlusher(flushURL, flushToken),
 	}
 }
 
@@ -83,7 +68,7 @@ func (s *Server) Register(srv *sdkmcp.Server) {
 	// Only offered when a flush endpoint is configured: without one the tool
 	// could not do anything, and advertising a tool that always fails would
 	// waste a caller's attempt and muddy tool selection.
-	if s.flushURL != "" {
+	if s.flusher.Enabled() {
 		sdkmcp.AddTool(srv, &sdkmcp.Tool{
 			Name: "flush_buffer",
 			Description: "Make recently received telemetry queryable immediately. " +
@@ -105,28 +90,8 @@ type flushArgs struct{}
 // query side is allowed to request a flush but must never be able to write
 // telemetry, so the two secrets stay separate.
 func (s *Server) flushBuffer(ctx context.Context, req *sdkmcp.CallToolRequest, args flushArgs) (*sdkmcp.CallToolResult, any, error) {
-	if s.flushURL == "" {
-		return errResult("flush is not configured: the server was started without a flush endpoint")
-	}
-
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, s.flushURL, nil)
-	if err != nil {
-		return errResult(fmt.Sprintf("building flush request: %v", err))
-	}
-	if s.flushToken != "" {
-		httpReq.Header.Set("Authorization", "Bearer "+s.flushToken)
-	}
-
-	resp, err := s.httpClient.Do(httpReq)
-	if err != nil {
-		return errResult(fmt.Sprintf("flush request failed: %v", err))
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		return errResult(fmt.Sprintf("flush rejected: %s: %s",
-			resp.Status, strings.TrimSpace(string(body))))
+	if err := s.flusher.Flush(ctx); err != nil {
+		return errResult(err.Error())
 	}
 
 	return &sdkmcp.CallToolResult{
