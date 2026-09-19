@@ -11,7 +11,35 @@ const TOKEN_KEY = "ducktel_token";
 const state = {
   tenant: null,
   tenants: [],
+  connected: false,
 };
+
+// --- deep links ---
+//
+// Every search/query run rewrites the URL hash to exactly the params it used,
+// so the address bar is always a permalink to what's on screen — copy it,
+// share it, or have an agent construct one directly (#traces?tenant=...&
+// trace_id=... or #metrics?tenant=...&metric_name=...&aggregation=...) to
+// land straight on a specific view instead of an empty form.
+
+function parseHash() {
+  const raw = location.hash.replace(/^#/, "");
+  const qIdx = raw.indexOf("?");
+  const view = qIdx === -1 ? raw : raw.slice(0, qIdx);
+  const query = qIdx === -1 ? "" : raw.slice(qIdx + 1);
+  return { view, params: new URLSearchParams(query) };
+}
+
+// setHash uses replaceState rather than assigning location.hash directly, so
+// it never fires our own hashchange listener or adds a history entry per
+// keystroke/run — only a real navigation (pasted link, back/forward) should
+// trigger a reload of the view.
+function setHash(view, params) {
+  const next = "#" + view + "?" + params.toString();
+  if (location.hash !== next) {
+    history.replaceState(null, "", next);
+  }
+}
 
 // --- token / auth ---
 
@@ -109,12 +137,26 @@ async function resolveTenant() {
   select.innerHTML = state.tenants.map((t) => `<option value="${escapeHtml(t)}">${escapeHtml(t)}</option>`).join("");
   state.tenant = state.tenants[0];
   select.value = state.tenant;
-  select.onchange = () => {
+  select.onchange = async () => {
     state.tenant = select.value;
-    loadServices();
-    loadMetricNames();
-    runTraceSearch();
+    await loadServices();
+    await loadMetricNames();
+    await runTraceSearch();
   };
+}
+
+// syncTenantPicker reflects state.tenant into whichever tenant UI is visible
+// (picker or label), for when a deep link names a tenant other than the
+// auto-selected default.
+function syncTenantPicker() {
+  const wrap = document.getElementById("tenant-picker-wrap");
+  if (!wrap.classList.contains("hidden")) {
+    document.getElementById("tenant-picker").value = state.tenant;
+  }
+  const label = document.getElementById("tenant-label");
+  if (!label.classList.contains("hidden")) {
+    label.textContent = "tenant: " + state.tenant;
+  }
 }
 
 // --- services (for the traces filter dropdown) ---
@@ -161,32 +203,34 @@ async function loadConfig() {
 
 // --- tabs ---
 
+function activateTab(name) {
+  document.querySelectorAll(".tab-btn").forEach((b) => b.classList.toggle("active", b.dataset.tab === name));
+  document.querySelectorAll(".tab").forEach((sec) => sec.classList.toggle("hidden", sec.id !== "tab-" + name));
+}
+
 function initTabs() {
   document.querySelectorAll(".tab-btn").forEach((btn) => {
-    btn.addEventListener("click", () => {
-      document.querySelectorAll(".tab-btn").forEach((b) => b.classList.remove("active"));
-      btn.classList.add("active");
-      const target = btn.dataset.tab;
-      document.querySelectorAll(".tab").forEach((sec) => {
-        sec.classList.toggle("hidden", sec.id !== "tab-" + target);
-      });
-    });
+    btn.addEventListener("click", () => activateTab(btn.dataset.tab));
   });
 }
 
 // --- traces view ---
 
+function addAttrFilterRow(key, value) {
+  const row = document.createElement("div");
+  row.className = "attr-filter-row";
+  row.innerHTML = `
+    <input type="text" placeholder="key" class="attr-key">
+    <input type="text" placeholder="value" class="attr-value">
+    <button type="button" class="secondary remove-filter">×</button>`;
+  row.querySelector(".attr-key").value = key || "";
+  row.querySelector(".attr-value").value = value || "";
+  row.querySelector(".remove-filter").addEventListener("click", () => row.remove());
+  document.getElementById("f-attr-filters").appendChild(row);
+}
+
 function initAttrFilters() {
-  document.getElementById("f-add-filter").addEventListener("click", () => {
-    const row = document.createElement("div");
-    row.className = "attr-filter-row";
-    row.innerHTML = `
-      <input type="text" placeholder="key" class="attr-key">
-      <input type="text" placeholder="value" class="attr-value">
-      <button type="button" class="secondary remove-filter">×</button>`;
-    row.querySelector(".remove-filter").addEventListener("click", () => row.remove());
-    document.getElementById("f-attr-filters").appendChild(row);
-  });
+  document.getElementById("f-add-filter").addEventListener("click", () => addAttrFilterRow("", ""));
 }
 
 function collectAttrFilters() {
@@ -223,6 +267,8 @@ async function runTraceSearch() {
   params.set("since_minutes", document.getElementById("f-since").value || "60");
   params.set("limit", document.getElementById("f-limit").value || "100");
   collectAttrFilters().forEach((f) => params.append("filter", f));
+
+  setHash("traces", params);
 
   let resp;
   try {
@@ -263,6 +309,12 @@ async function loadWaterfall(traceId) {
     toast(e.message, true);
     return;
   }
+  // Record trace_id in the hash so this exact waterfall is itself a
+  // permalink, not just the search that found it.
+  const { params: hashParams } = parseHash();
+  hashParams.set("trace_id", traceId);
+  setHash("traces", hashParams);
+
   const spans = resp.rows;
   const wf = document.getElementById("waterfall");
   wf.classList.remove("hidden");
@@ -325,6 +377,8 @@ async function runMetricQuery() {
   params.set("since_minutes", document.getElementById("m-since").value || "60");
   const groupBy = document.getElementById("m-groupby").value.trim();
   if (groupBy) params.set("group_by", groupBy);
+
+  setHash("metrics", params);
 
   const out = document.getElementById("metric-result");
   let resp;
@@ -391,6 +445,73 @@ function escapeHtml(s) {
     .replace(/"/g, "&quot;");
 }
 
+// --- deep-link application ---
+
+function fillTracesForm(params) {
+  const service = params.get("service_name");
+  if (service) document.getElementById("f-service").value = service;
+  const since = params.get("since_minutes");
+  if (since) document.getElementById("f-since").value = since;
+  const limit = params.get("limit");
+  if (limit) document.getElementById("f-limit").value = limit;
+
+  const container = document.getElementById("f-attr-filters");
+  container.innerHTML = "";
+  params.getAll("filter").forEach((f) => {
+    const idx = f.indexOf(":");
+    const k = idx === -1 ? f : f.slice(0, idx);
+    const v = idx === -1 ? "" : f.slice(idx + 1);
+    addAttrFilterRow(k, v);
+  });
+}
+
+function fillMetricsForm(params) {
+  const name = params.get("metric_name");
+  if (name) document.getElementById("m-name").value = name;
+  const agg = params.get("aggregation");
+  if (agg) document.getElementById("m-agg").value = agg;
+  const since = params.get("since_minutes");
+  if (since) document.getElementById("m-since").value = since;
+  const groupBy = params.get("group_by");
+  if (groupBy) document.getElementById("m-groupby").value = groupBy;
+}
+
+// applyInitialView reads the URL hash (if any) and either lands directly on
+// the view it describes, or falls back to the plain "show recent traces"
+// default. Runs once after connecting, and again on hashchange (a pasted
+// link, or back/forward) so the same open tab can be redirected to a
+// different deep link without a full reload.
+async function applyInitialView() {
+  const { view, params } = parseHash();
+
+  const hashTenant = params.get("tenant");
+  if (hashTenant && state.tenants.includes(hashTenant) && hashTenant !== state.tenant) {
+    state.tenant = hashTenant;
+    syncTenantPicker();
+    await loadServices();
+    await loadMetricNames();
+  }
+
+  if (view === "metrics") {
+    activateTab("metrics");
+    fillMetricsForm(params);
+    if (document.getElementById("m-name").value) {
+      await runMetricQuery();
+    }
+    return;
+  }
+
+  activateTab("traces");
+  fillTracesForm(params);
+  if (state.tenant) {
+    await runTraceSearch();
+    const traceId = params.get("trace_id");
+    if (traceId) {
+      await loadWaterfall(traceId);
+    }
+  }
+}
+
 // --- boot ---
 
 async function connect() {
@@ -404,12 +525,10 @@ async function connect() {
   await loadServices();
   await loadMetricNames();
   await loadConfig();
-  // Auto-load so the first thing you see isn't an empty table — but only if
-  // there's actually a tenant to query; on a fresh install with zero data
-  // yet, an immediate "no tenant" toast would just be noise.
-  if (state.tenant) {
-    await runTraceSearch();
-  }
+  state.connected = true;
+  // Lands on whatever the URL hash describes, or falls back to a plain
+  // recent-traces view so the first thing you see isn't an empty table.
+  await applyInitialView();
 }
 
 function initGate() {
@@ -441,6 +560,14 @@ function init() {
     runMetricQuery();
   });
   document.getElementById("flush-btn").addEventListener("click", runFlush);
+
+  // A pasted deep link or back/forward navigation while already connected
+  // should re-apply, not sit ignored. setHash uses replaceState (no event),
+  // so this only fires for real navigations — no feedback loop with our own
+  // updates.
+  window.addEventListener("hashchange", () => {
+    if (state.connected) applyInitialView();
+  });
 
   // If a token is already stored (same tab, page reload), skip the gate.
   if (getToken()) {
