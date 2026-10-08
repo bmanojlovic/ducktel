@@ -272,39 +272,40 @@ func nextPath(dir string, now time.Time) (string, error) {
 	}
 }
 
-// retentionCheckInterval is fixed regardless of flush-interval: pruning is
-// day-granular, so checking hourly is more than enough and keeps retention
-// independent of how aggressively flush-interval happens to be tuned.
-const retentionCheckInterval = time.Hour
+// maintenanceInterval is fixed regardless of flush-interval: retention and
+// compaction are both day-granular, so checking hourly is more than enough.
+const maintenanceInterval = time.Hour
+
+// maintenance runs the day-granular housekeeping: retention pruning (a no-op
+// while retention is disabled) and compaction of past days' per-flush files.
+// Both are crash-safe and cheap no-ops when there is nothing to do.
+func (w *Writer) maintenance() {
+	if err := w.pruneOldData(); err != nil {
+		w.report(err)
+	}
+	if err := w.compactOldDays(); err != nil {
+		w.report(err)
+	}
+}
 
 func (w *Writer) Start() {
 	go func() {
 		defer close(w.done)
 		ticker := time.NewTicker(w.flushInterval)
 		defer ticker.Stop()
+		maintTicker := time.NewTicker(maintenanceInterval)
+		defer maintTicker.Stop()
 
-		// A nil channel blocks forever in a select, so retention simply never
-		// fires when disabled — no separate enabled/disabled branching needed
-		// in the loop below.
-		var retentionCh <-chan time.Time
-		w.mu.Lock()
-		enabled := w.retention > 0
-		w.mu.Unlock()
-		if enabled {
-			retentionTicker := time.NewTicker(retentionCheckInterval)
-			defer retentionTicker.Stop()
-			retentionCh = retentionTicker.C
-			// Sweep once at startup too, so a long-stopped process does not
-			// wait a full hour before catching up on backlog.
-			w.report(w.pruneOldData())
-		}
+		// Run once at startup too, so a long-stopped process catches up on
+		// backlog instead of waiting a full hour.
+		w.maintenance()
 
 		for {
 			select {
 			case <-ticker.C:
 				w.report(w.Flush())
-			case <-retentionCh:
-				w.report(w.pruneOldData())
+			case <-maintTicker.C:
+				w.maintenance()
 			case <-w.stopCh:
 				w.report(w.Flush())
 				return

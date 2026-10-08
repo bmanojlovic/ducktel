@@ -91,7 +91,15 @@ ducktel serve --retention 720h    # or any Go duration
 ```
 
 - Day-granular, not per-record: a directory is either kept whole or removed
-  whole. There is no compaction of what's kept and no partial-day pruning.
+  whole. There is no partial-day pruning.
+- **Compaction runs on the same hourly/startup schedule, always** (it does not
+  need `--retention`): each past day's per-flush files merge into one
+  `day.parquet` per signal, chronological order preserved. Today's directory
+  is never touched (the writer is live in it). Crash-safe: an existing
+  `day.parquet` means the merge finished, so leftover per-flush files are
+  deleted rather than merged (merging would double rows). This is the
+  structural fix for the "every query opens every file" pathology — a
+  day becomes one file instead of ~2880.
 - A directory name that doesn't parse as `YYYY-MM-DD` is left alone rather
   than guessed at.
 - Runs once immediately on startup (so a long-stopped process catches up on
