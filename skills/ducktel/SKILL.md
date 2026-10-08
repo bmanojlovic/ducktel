@@ -164,7 +164,7 @@ caller's job.
 |------|---------|
 | `trace_lookup(trace_id, tenant)` | every span of one trace, ordered by start time |
 | `span_search(filters, service_name, since_minutes, tenant, limit)` | spans matching attribute key/value filters |
-| `metric_query(metric_name, aggregation, since_minutes, group_by, tenant)` | metric aggregation: avg, sum, min, max, count, p50, p95, p99 |
+| `metric_query(metric_name, aggregation, since_minutes, group_by, tenant, filters)` | metric aggregation: avg, sum, min, max, count, p50, p95, p99 |
 | `flush_buffer()` | make just-received telemetry queryable now (see Flush semantics) |
 
 **Tenant isolation is mandatory.** `tenant` is a *required* parameter on every query
@@ -266,6 +266,7 @@ For common query patterns, see [references/queries.md](references/queries.md).
 - **Span kinds** are strings: `SPAN_KIND_SERVER`, `SPAN_KIND_CLIENT`, `SPAN_KIND_PRODUCER`, `SPAN_KIND_CONSUMER`, `SPAN_KIND_INTERNAL`.
 - **Metric types** are lowercase strings: `gauge`, `sum`, `histogram`, `summary`.
 - **`metric_query` only aggregates `value_double`, which gauge and sum populate.** Histogram points keep their data in `sum`/`min`/`max`/`count`/`bucket_counts` and are invisible to `metric_query` — it returns `0`, not an error. So send a per-event duration or size as a **gauge** (or a counter as a **sum**), not a histogram, if you want it aggregatable. Histograms are still stored and can be read with raw SQL over the `metrics` table.
+- **`metric_query` grouping:** `group_by` is comma-separated; each key is a plain column (`service_name`, `metric_type`, …) or a data-point attribute written `attr.<key>` / `attributes.<key>` — e.g. `group_by: "attr.kind"` splits the aggregate by the metric point's `attributes` JSON key `kind`, and the result rows carry `attr.kind` as their column name. Attribute keys are validated against `[A-Za-z0-9_.-]`. `filters` matches attribute key/value pairs against data-point attributes OR resource attributes, same as `span_search`.
 - **Filter values are bound, not interpolated.** The `traces`/`logs`/`metrics` commands pass filter values to DuckDB as parameters, so a service name or search term containing quotes is matched literally — it cannot alter the query. `--limit` is validated and capped at 10000.
 - **`query` and `saved run` execute raw SQL by design.** There is no sandbox on `ducktel query "<sql>"`; it runs whatever you give it, including DDL. That is intentional (it is the SQL escape hatch for agents), so treat its input as trusted.
 

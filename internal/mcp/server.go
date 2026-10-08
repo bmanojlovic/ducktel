@@ -148,15 +148,21 @@ func (s *Server) spanSearch(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 // --- metric_query ---
 
 type metricQueryArgs struct {
-	Tenant       string `json:"tenant" jsonschema:"the tenant to query; only data for this tenant is returned"`
-	MetricName   string `json:"metric_name" jsonschema:"the metric name to aggregate, e.g. process.cpu.utilization"`
-	Aggregation  string `json:"aggregation" jsonschema:"one of: avg, sum, min, max, count, p50, p95, p99"`
-	SinceMinutes int    `json:"since_minutes,omitempty" jsonschema:"how far back to aggregate, in minutes. Default 60."`
-	GroupBy      string `json:"group_by,omitempty" jsonschema:"optional column to group by, e.g. service_name or metric_type"`
+	Tenant       string       `json:"tenant" jsonschema:"the tenant to query; only data for this tenant is returned"`
+	MetricName   string       `json:"metric_name" jsonschema:"the metric name to aggregate, e.g. process.cpu.utilization"`
+	Aggregation  string       `json:"aggregation" jsonschema:"one of: avg, sum, min, max, count, p50, p95, p99"`
+	SinceMinutes int          `json:"since_minutes,omitempty" jsonschema:"how far back to aggregate, in minutes. Default 60."`
+	GroupBy      string       `json:"group_by,omitempty" jsonschema:"optional comma-separated grouping keys: a column name (service_name, metric_type, ...) or a data-point attribute as attr.<key> / attributes.<key>, e.g. attr.kind groups by the metric point's attributes JSON key 'kind'. Result rows carry the key as their column name."`
+	Filters      []attrFilter `json:"filters,omitempty" jsonschema:"attribute key/value pairs to match, ANDed together; matched against data-point attributes OR resource attributes, same as span_search filters. Dotted keys are handled correctly."`
 }
 
 func (s *Server) metricQuery(ctx context.Context, req *sdkmcp.CallToolRequest, args metricQueryArgs) (*sdkmcp.CallToolResult, any, error) {
-	rows, cols, err := s.core.QueryMetric(args.Tenant, args.MetricName, args.Aggregation, args.SinceMinutes, args.GroupBy)
+	filters := make([]telemetry.AttrFilter, len(args.Filters))
+	for i, f := range args.Filters {
+		filters[i] = telemetry.AttrFilter{Key: f.Key, Value: f.Value}
+	}
+
+	rows, cols, err := s.core.QueryMetric(args.Tenant, args.MetricName, args.Aggregation, args.SinceMinutes, args.GroupBy, filters)
 	if err != nil {
 		return errResult(err.Error())
 	}

@@ -128,9 +128,21 @@ func (h *Handlers) handleLookupTrace(w http.ResponseWriter, r *http.Request) {
 func (h *Handlers) handleQueryMetric(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 
+	// Filters arrive as repeated ?filter=key:value pairs, same as the span
+	// search endpoint.
+	var filters []telemetry.AttrFilter
+	for _, raw := range q["filter"] {
+		key, value, ok := strings.Cut(raw, ":")
+		if !ok {
+			http.Error(w, fmt.Sprintf("filter %q must be key:value", raw), http.StatusBadRequest)
+			return
+		}
+		filters = append(filters, telemetry.AttrFilter{Key: key, Value: value})
+	}
+
 	rows, cols, err := h.core.QueryMetric(
 		q.Get("tenant"), q.Get("metric_name"), q.Get("aggregation"),
-		queryInt(r, "since_minutes", 0), q.Get("group_by"),
+		queryInt(r, "since_minutes", 0), q.Get("group_by"), filters,
 	)
 	if err != nil {
 		writeErr(w, err)

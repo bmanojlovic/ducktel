@@ -136,7 +136,7 @@ func TestTenantIsolation(t *testing.T) {
 func TestMetricQueryIsTenantScoped(t *testing.T) {
 	c := newTestCore(t)
 
-	rows, _, err := c.QueryMetric("acme", "cpu.util", "count", 0, "")
+	rows, _, err := c.QueryMetric("acme", "cpu.util", "count", 0, "", nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -284,7 +284,7 @@ func TestMetricQueryAggregations(t *testing.T) {
 	c := newTestCore(t)
 
 	for _, agg := range []string{"avg", "sum", "min", "max", "count", "p50", "p95", "p99"} {
-		rows, _, err := c.QueryMetric("acme", "cpu.util", agg, 0, "")
+		rows, _, err := c.QueryMetric("acme", "cpu.util", agg, 0, "", nil)
 		if err != nil {
 			t.Errorf("aggregation %q errored: %v", agg, err)
 			continue
@@ -300,7 +300,7 @@ func TestMetricQueryRejectsUnknownAggregation(t *testing.T) {
 
 	// An injection-shaped aggregation must be rejected, not interpolated.
 	for _, agg := range []string{"median", "avg(value_double); DROP VIEW metrics; --", ""} {
-		_, _, err := c.QueryMetric("acme", "cpu.util", agg, 0, "")
+		_, _, err := c.QueryMetric("acme", "cpu.util", agg, 0, "", nil)
 		if err == nil {
 			t.Errorf("aggregation %q should be rejected", agg)
 		}
@@ -313,7 +313,7 @@ func TestMetricQueryRejectsUnknownAggregation(t *testing.T) {
 func TestMetricQueryGroupBy(t *testing.T) {
 	c := newTestCore(t)
 
-	rows, _, err := c.QueryMetric("acme", "cpu.util", "count", 0, "service_name")
+	rows, _, err := c.QueryMetric("acme", "cpu.util", "count", 0, "service_name", nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -327,7 +327,7 @@ func TestMetricQueryRejectsUngroupableColumn(t *testing.T) {
 	c := newTestCore(t)
 
 	for _, col := range []string{"nonexistent", "service_name; DROP VIEW metrics; --", "1"} {
-		_, _, err := c.QueryMetric("acme", "cpu.util", "count", 0, col)
+		_, _, err := c.QueryMetric("acme", "cpu.util", "count", 0, col, nil)
 		if err == nil {
 			t.Errorf("group_by %q should be rejected", col)
 		}
@@ -337,9 +337,211 @@ func TestMetricQueryRejectsUngroupableColumn(t *testing.T) {
 func TestMetricQueryRequiresName(t *testing.T) {
 	c := newTestCore(t)
 
-	_, _, err := c.QueryMetric("acme", "", "avg", 0, "")
+	_, _, err := c.QueryMetric("acme", "", "avg", 0, "", nil)
 	if err == nil {
 		t.Error("metric query without metric_name should error")
+	}
+}
+
+// --- attr.<key> group_by ---
+
+// newAttrMetricCore seeds metric points carrying data-point attributes, the
+// shape a nightly-batch pipeline's telemetry actually uses (kind gen|judge, backend
+// local|alibaba), plus one point from another tenant to prove isolation
+// still holds through the new grouping path.
+func newAttrMetricCore(t *testing.T) *Core {
+	t.Helper()
+	dir := t.TempDir()
+	w := writer.New(dir, time.Hour, 1000)
+
+	point := func(tenant, kind, backend string, v float64) writer.MetricPoint {
+		return writer.MetricPoint{
+			MetricName: "night.calls", MetricType: "sum", Timestamp: time.Now().UnixMicro(),
+			ValueDouble:        v,
+			Attributes:         `{"kind":"` + kind + `","backend":"` + backend + `"}`,
+			ResourceAttributes: `{"service.name":"night-pipeline","tenant.id":"` + tenant + `"}`,
+		}
+	}
+	w.AddMetrics([]writer.MetricPoint{
+		point("owner", "gen", "local", 1.0),
+		point("owner", "gen", "alibaba", 1.0),
+		point("owner", "judge", "local", 1.0),
+		point("owner", "judge", "alibaba", 1.0),
+		point("owner", "gen", "local", 1.0), // second gen/local point: sums must fold it in
+		point("other-tenant", "gen", "local", 999.0),
+	})
+	if err := w.Flush(); err != nil {
+		t.Fatalf("seeding: %v", err)
+	}
+
+	engine, err := query.Open(dir)
+	if err != nil {
+		t.Fatalf("opening engine: %v", err)
+	}
+	t.Cleanup(func() { engine.Close() })
+	return NewCore(engine)
+}
+
+func TestMetricQueryGroupByAttrKey(t *testing.T) {
+	c := newAttrMetricCore(t)
+
+	rows, cols, err := c.QueryMetric("owner", "night.calls", "sum", 0, "attr.kind", nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	// The alias must surface as the result column name, per the ticket ask.
+	if len(cols) != 2 || cols[0] != "attr.kind" || cols[1] != "value" {
+		t.Fatalf("columns = %v, want [attr.kind value]", cols)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("got %d rows, want 2 (gen, judge): %v", len(rows), rows)
+	}
+	sums := map[string]float64{}
+	for _, r := range rows {
+		sums[r["attr.kind"].(string)] = asFloat64(t, r["value"])
+	}
+	// 3 gen points (1+1+1) and 2 judge points — and the other tenant's 999
+	// must not leak in.
+	if sums["gen"] != 3 || sums["judge"] != 2 {
+		t.Errorf("sums = %v, want gen=3 judge=2", sums)
+	}
+}
+
+func TestMetricQueryGroupByAttributesPrefix(t *testing.T) {
+	c := newAttrMetricCore(t)
+
+	rows, _, err := c.QueryMetric("owner", "night.calls", "count", 0, "attributes.kind", nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(rows) != 2 {
+		t.Errorf("got %d rows, want 2 via attributes.kind form", len(rows))
+	}
+}
+
+func TestMetricQueryGroupByMultipleAttrKeys(t *testing.T) {
+	c := newAttrMetricCore(t)
+
+	rows, cols, err := c.QueryMetric("owner", "night.calls", "count", 0, "attr.kind,attr.backend", nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(cols) != 3 || cols[0] != "attr.kind" || cols[1] != "attr.backend" {
+		t.Fatalf("columns = %v, want [attr.kind attr.backend value]", cols)
+	}
+	if len(rows) != 4 {
+		t.Errorf("got %d rows, want 4 (kind x backend combos): %v", len(rows), rows)
+	}
+}
+
+func TestMetricQueryMixedColumnAndAttrGroupBy(t *testing.T) {
+	c := newAttrMetricCore(t)
+
+	// A plain column and an attribute key in the same group_by.
+	rows, _, err := c.QueryMetric("owner", "night.calls", "count", 0, "service_name,attr.kind", nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(rows) != 2 { // one service_name value, two kinds
+		t.Errorf("got %d rows, want 2: %v", len(rows), rows)
+	}
+}
+
+func TestMetricQueryRejectsBadAttrKey(t *testing.T) {
+	c := newAttrMetricCore(t)
+
+	for _, key := range []string{
+		"attr.kind; DROP VIEW metrics; --",
+		`attr."kind"`,
+		"attr.",
+		"attr.kind service_name",
+		"attr.kind' OR '1'='1",
+	} {
+		_, _, err := c.QueryMetric("owner", "night.calls", "count", 0, key, nil)
+		if err == nil {
+			t.Errorf("group_by %q should be rejected", key)
+			continue
+		}
+		if !IsInvalidInput(err) {
+			t.Errorf("group_by %q rejection should classify as invalid input: %v", key, err)
+		}
+	}
+
+	// And the store must still be intact after the injection attempts.
+	rows, _, err := c.QueryMetric("owner", "night.calls", "count", 0, "", nil)
+	if err != nil {
+		t.Fatalf("store damaged after injection attempts: %v", err)
+	}
+	if n := countRows(rows); n != 1 {
+		t.Errorf("post-injection count row = %d, want 1", n)
+	}
+}
+
+func TestMetricQueryAttributeFilters(t *testing.T) {
+	c := newAttrMetricCore(t)
+
+	// Filter on a data-point attribute: only gen points.
+	rows, _, err := c.QueryMetric("owner", "night.calls", "count", 0, "", []AttrFilter{{Key: "kind", Value: "gen"}})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if n := countRows(rows); n != 1 {
+		t.Fatalf("expected 1 aggregate row, got %d", n)
+	}
+	if got := asFloat64(t, rows[0]["value"]); got != 3 {
+		t.Errorf("gen count = %v, want 3 (2 owner-local + 1 owner-alibaba, tenant-scoped)", got)
+	}
+
+	// Filter on a RESOURCE attribute must also match (same dual scope as
+	// span_search): only the local backend points... backend is a data-point
+	// attr here; use service.name for the resource-side check.
+	rows, _, err = c.QueryMetric("owner", "night.calls", "count", 0, "",
+		[]AttrFilter{{Key: "service.name", Value: "night-pipeline"}})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got := asFloat64(t, rows[0]["value"]); got != 5 {
+		t.Errorf("resource-attr filter count = %v, want 5 (all owner points)", got)
+	}
+
+	// Both filter types ANDed: gen AND alibaba -> the single alibaba gen point.
+	rows, _, err = c.QueryMetric("owner", "night.calls", "sum", 0, "",
+		[]AttrFilter{{Key: "kind", Value: "gen"}, {Key: "backend", Value: "alibaba"}})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got := asFloat64(t, rows[0]["value"]); got != 1 {
+		t.Errorf("gen+alibaba sum = %v, want 1", got)
+	}
+
+	// Injection-shaped filter values stay data, like span_search's test.
+	rows, _, err = c.QueryMetric("owner", "night.calls", "count", 0, "",
+		[]AttrFilter{{Key: "kind", Value: "gen' OR '1'='1"}})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if n := countRows(rows); n != 1 || asFloat64(t, rows[0]["value"]) != 0 {
+		t.Errorf("injection filter should match nothing: %v", rows)
+	}
+}
+
+func TestMetricQueryAttrGroupByAndFilterCombined(t *testing.T) {
+	c := newAttrMetricCore(t)
+
+	rows, _, err := c.QueryMetric("owner", "night.calls", "sum", 0, "attr.backend",
+		[]AttrFilter{{Key: "kind", Value: "judge"}})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("got %d rows, want 2 (local, alibaba): %v", len(rows), rows)
+	}
+	sums := map[string]float64{}
+	for _, r := range rows {
+		sums[r["attr.backend"].(string)] = asFloat64(t, r["value"])
+	}
+	if sums["local"] != 1 || sums["alibaba"] != 1 {
+		t.Errorf("judge sums = %v, want local=1 alibaba=1", sums)
 	}
 }
 

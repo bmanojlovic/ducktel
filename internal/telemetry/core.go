@@ -164,14 +164,77 @@ func (c *Core) SearchSpans(tenant, serviceName string, filters []AttrFilter, sin
 	return c.engine.Query(q, params...)
 }
 
-// QueryMetric aggregates a metric over a time range, optionally grouped by a
-// column, scoped to tenant.
+// metricGroupKeys splits a group_by string into individual keys: comma-
+// separated, whitespace-trimmed, empty parts dropped. An empty group_by means
+// no grouping at all.
+func metricGroupKeys(groupBy string) []string {
+	var keys []string
+	for _, part := range strings.Split(groupBy, ",") {
+		if k := strings.TrimSpace(part); k != "" {
+			keys = append(keys, k)
+		}
+	}
+	return keys
+}
+
+// attrKeyCharset bounds what an attr.<key> group key may contain. Because the
+// validated key is later embedded in a single-quoted JSON-path string literal
+// (the "strictly quoted" option — identifiers cannot be bound as parameters
+// and SELECT-list placeholders would scramble param ordering), the charset
+// deliberately excludes both quote characters so nothing can break out.
+const attrKeyCharset = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.-"
+
+func validAttrKey(key string) bool {
+	if key == "" {
+		return false
+	}
+	for _, r := range key {
+		if !strings.ContainsRune(attrKeyCharset, r) {
+			return false
+		}
+	}
+	return true
+}
+
+// metricGroupExpr resolves one group_by key to (SQL expression, result alias).
+// A plain column name must be on the knownColumns allowlist; a data-point
+// attribute key is written attr.<key> (or attributes.<key>) and extracts
+// json_extract_string(attributes, '$."<key>"'), aliased back to the key so
+// the result rows carry e.g. "attr.kind". The attribute form is how
+// metric_query reaches data-point attributes like kind/backend/status, which
+// live in the metrics.attributes JSON column rather than as first-class
+// columns.
+func metricGroupExpr(key string) (expr, alias string, ok bool) {
+	for _, prefix := range []string{"attr.", "attributes."} {
+		if rest, found := strings.CutPrefix(key, prefix); found {
+			if !validAttrKey(rest) {
+				return "", "", false
+			}
+			// Safe to embed: rest passed validAttrKey, so it contains no quote
+			// characters and jsonPath's own escaping is a no-op here.
+			return fmt.Sprintf("json_extract_string(attributes, '%s')", jsonPath(rest)), key, true
+		}
+	}
+	col, ok := quoteIdent(key)
+	if !ok {
+		return "", "", false
+	}
+	return col, col, true
+}
+
+// QueryMetric aggregates a metric over a time range, optionally grouped by
+// columns and/or data-point attribute keys, scoped to tenant.
+//
+// groupBy is comma-separated; each key is either a plain column (the
+// knownColumns allowlist) or attr.<key> / attributes.<key> for a data-point
+// attribute. filters match on data-point attributes OR resource attributes,
+// exactly like span_search.
 //
 // value_double is the normalised numeric column: it is populated for both
 // double and int points (see the receiver's fillNumberDataPoint). A histogram
 // point stores its data in sum/min/max/count/bucket_counts instead and is
 // therefore invisible here — it aggregates to 0, not an error.
-func (c *Core) QueryMetric(tenant, metricName, aggregation string, sinceMinutes int, groupBy string) ([]map[string]any, []string, error) {
+func (c *Core) QueryMetric(tenant, metricName, aggregation string, sinceMinutes int, groupBy string, filters []AttrFilter) ([]map[string]any, []string, error) {
 	if err := validateTenant(tenant); err != nil {
 		return nil, nil, err
 	}
@@ -191,26 +254,49 @@ func (c *Core) QueryMetric(tenant, metricName, aggregation string, sinceMinutes 
 	cutoff := time.Now().Add(-time.Duration(since) * time.Minute).UnixMicro()
 
 	selectCols := []string{}
-	groupCols := []string{}
-	if groupBy != "" {
-		col, ok := quoteIdent(groupBy)
+	groupKeys := metricGroupKeys(groupBy)
+	for _, key := range groupKeys {
+		expr, alias, ok := metricGroupExpr(key)
 		if !ok {
-			return nil, nil, invalidInput("group_by %q is not a groupable column; allowed: %s",
-				groupBy, knownColumnsList())
+			return nil, nil, invalidInput(
+				"group_by %q is not a groupable column; allowed columns: %s — or attr.<key> / attributes.<key> for a data-point attribute (key charset %s)",
+				key, knownColumnsList(), attrKeyCharset)
 		}
-		selectCols = append(selectCols, col)
-		groupCols = append(groupCols, col)
+		if expr == alias {
+			selectCols = append(selectCols, expr)
+		} else {
+			selectCols = append(selectCols, fmt.Sprintf(`%s AS "%s"`, expr, alias))
+		}
 	}
 	selectCols = append(selectCols, fmt.Sprintf("%s AS value", agg))
 
-	q := "SELECT " + strings.Join(selectCols, ", ") + ` FROM metrics
-	      WHERE metric_name = ?
-	        AND timestamp >= ?
-	        AND ` + c.tenantPredicate()
+	conds := []string{"metric_name = ?", "timestamp >= ?", c.tenantPredicate()}
 	params := []any{metricName, cutoff, tenant}
 
-	if len(groupCols) > 0 {
-		q += " GROUP BY " + strings.Join(groupCols, ", ") + " ORDER BY " + groupCols[0]
+	for _, f := range filters {
+		if f.Key == "" {
+			return nil, nil, invalidInput("attribute filter key must not be empty")
+		}
+		// Same dual-scope match as span_search: a caller should not need to
+		// know whether a key lives in data-point attributes or resource
+		// attributes.
+		conds = append(conds,
+			"(json_extract_string(attributes, ?) = ? OR json_extract_string(resource_attributes, ?) = ?)")
+		params = append(params, jsonPath(f.Key), f.Value, jsonPath(f.Key), f.Value)
+	}
+
+	q := "SELECT " + strings.Join(selectCols, ", ") + ` FROM metrics
+	      WHERE ` + strings.Join(conds, " AND ")
+
+	if len(groupKeys) > 0 {
+		// Positional GROUP BY/ORDER BY: the group expressions are the first
+		// selectCols, in order, so this refers to them without repeating
+		// their (embedded) expressions.
+		positions := make([]string, len(groupKeys))
+		for i := range positions {
+			positions[i] = fmt.Sprintf("%d", i+1)
+		}
+		q += " GROUP BY " + strings.Join(positions, ", ") + " ORDER BY 1"
 	}
 
 	return c.engine.Query(q, params...)
