@@ -195,7 +195,86 @@ func TestSchemaDefaultsToTraces(t *testing.T) {
 
 // TestOpenNonWritableDirSurfacesError verifies a bad data dir fails loudly at
 // Open rather than producing an engine that silently returns nothing.
-func TestOpenNonWritableDirSurfacesError(t *testing.T) {
+func TestCgroupMemoryLimitParsing(t *testing.T) {
+	write := func(t *testing.T, content string) string {
+		t.Helper()
+		f := filepath.Join(t.TempDir(), "mem")
+		if err := os.WriteFile(f, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return f
+	}
+
+	cases := []struct {
+		name    string
+		content string
+		want    int64
+	}{
+		{"v2 bytes", "4294967296", 4 << 30},
+		{"v2 max", "max", 0},
+		{"v1 bytes", "1073741824", 1 << 30},
+		{"v1 unlimited sentinel", "9223372036854771712", 0},
+		{"garbage", "not-a-number", 0},
+		{"negative", "-5", 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			old := cgroupMemoryFiles
+			cgroupMemoryFiles = []string{write(t, tc.content)}
+			t.Cleanup(func() { cgroupMemoryFiles = old })
+
+			if got := cgroupMemoryLimit(); got != tc.want {
+				t.Errorf("cgroupMemoryLimit(%q) = %d, want %d", tc.content, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestCgroupMemoryLimitMissingFiles(t *testing.T) {
+	old := cgroupMemoryFiles
+	cgroupMemoryFiles = []string{filepath.Join(t.TempDir(), "does-not-exist")}
+	t.Cleanup(func() { cgroupMemoryFiles = old })
+
+	if got := cgroupMemoryLimit(); got != 0 {
+		t.Errorf("missing files should yield 0, got %d", got)
+	}
+}
+
+// TestMemoryLimitAppliedWhenCgroupLimited pins the OOM guard: with a cgroup
+// limit present, the engine must cap DuckDB's memory_limit below it so wide
+// queries spill instead of killing the process.
+func TestMemoryLimitAppliedWhenCgroupLimited(t *testing.T) {
+	limitFile := filepath.Join(t.TempDir(), "mem")
+	if err := os.WriteFile(limitFile, []byte("4294967296"), 0o644); err != nil { // 4Gi
+		t.Fatal(err)
+	}
+	old := cgroupMemoryFiles
+	cgroupMemoryFiles = []string{limitFile}
+	t.Cleanup(func() { cgroupMemoryFiles = old })
+
+	e, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+
+	rows, _, err := e.Query("SELECT value FROM duckdb_settings() WHERE name = 'memory_limit'")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("memory_limit setting not returned: %v", rows)
+	}
+	got := rows[0]["value"].(string)
+	// 4Gi limit * 70%, rounded down to whole MiB (2867 MiB); DuckDB renders
+	// the stored setting in its normalised human form.
+	want := "2.7 GiB"
+	if got != want {
+		t.Errorf("memory_limit = %s, want %s", got, want)
+	}
+}
+
+func TestOpenOnNonWritableDirSurfacesError(t *testing.T) {
 	dir := t.TempDir()
 	// Occupy the traces path with a regular file so view creation fails.
 	if err := os.WriteFile(filepath.Join(dir, "traces"), []byte("x"), 0o644); err != nil {

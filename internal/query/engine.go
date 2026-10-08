@@ -3,7 +3,10 @@ package query
 import (
 	"database/sql"
 	"fmt"
+	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 
 	_ "github.com/marcboeker/go-duckdb"
 )
@@ -29,10 +32,64 @@ type Engine struct {
 	dataDir string
 }
 
+// cgroupMemoryFiles are the paths read to detect a container memory limit —
+// cgroup v2 first, v1 second. A var so tests can point it at fixture files.
+var cgroupMemoryFiles = []string{
+	"/sys/fs/cgroup/memory.max",                   // cgroup v2: "max" or bytes
+	"/sys/fs/cgroup/memory/memory.limit_in_bytes", // cgroup v1: bytes
+}
+
+// cgroupMemoryLimit returns the cgroup memory limit in bytes, or 0 when there
+// is none (bare-metal dev machine, or the file says "max").
+func cgroupMemoryLimit() int64 {
+	for _, p := range cgroupMemoryFiles {
+		b, err := os.ReadFile(p)
+		if err != nil {
+			continue
+		}
+		s := strings.TrimSpace(string(b))
+		if s == "max" {
+			return 0
+		}
+		n, err := strconv.ParseInt(s, 10, 64)
+		if err != nil || n <= 0 {
+			continue
+		}
+		if n > 1<<60 {
+			// cgroup v1's "unlimited" sentinel (≈ 2^63); not a real limit.
+			continue
+		}
+		return n
+	}
+	return 0
+}
+
+// memoryLimitFraction is how much of the detected cgroup limit DuckDB's
+// buffer manager may use. The rest stays free for the Go heap and page cache,
+// so a wide query spills to DuckDB's temp directory instead of pushing the
+// whole process over the limit and getting OOM-killed.
+const memoryLimitFraction = 70
+
 func Open(dataDir string) (*Engine, error) {
 	db, err := sql.Open("duckdb", "")
 	if err != nil {
 		return nil, fmt.Errorf("opening duckdb: %w", err)
+	}
+
+	if limit := cgroupMemoryLimit(); limit > 0 {
+		// DuckDB sizes its buffer manager to ~80% of what it detects; inside
+		// a cgroup-limited container that left almost nothing for the rest of
+		// the process and wide scans OOM-killed the mcp container (measured:
+		// a 7-day metric scan pinned 4Gi). Capping below the limit makes the
+		// engine spill to disk rather than die. Division first, so an extreme
+		// cgroup value cannot overflow int64.
+		// DuckDB's memory_limit pragma wants a unit suffix; whole MiB, rounded
+		// down so the cap can only undershoot, never overshoot.
+		capped := limit / 100 * memoryLimitFraction / (1 << 20)
+		if _, err := db.Exec(fmt.Sprintf("PRAGMA memory_limit='%dMiB';", capped)); err != nil {
+			db.Close()
+			return nil, fmt.Errorf("setting duckdb memory_limit: %w", err)
+		}
 	}
 
 	e := &Engine{db: db, dataDir: dataDir}
