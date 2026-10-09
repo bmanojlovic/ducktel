@@ -13,6 +13,9 @@ const state = {
   tenant: null,
   tenants: [],
   connected: false,
+  // writtenHash is the last hash we set ourselves — see the hashchange
+  // listener for why every self-write must be recognisable.
+  writtenHash: "",
 };
 
 // --- deep links ---
@@ -31,13 +34,15 @@ function parseHash() {
   return { view, params: new URLSearchParams(query) };
 }
 
-// setHash uses replaceState rather than assigning location.hash directly, so
-// it never fires our own hashchange listener or adds a history entry per
-// keystroke/run — only a real navigation (pasted link, back/forward) should
-// trigger a reload of the view.
+// setHash updates the fragment via replaceState (no history entry per
+// search) and records what it wrote. The recording is load-bearing: browsers
+// have been observed firing hashchange for replaceState fragment changes, so
+// "we wrote it" is the only reliable way to tell our own URL updates apart
+// from a real navigation.
 function setHash(view, params) {
   const next = "#" + view + "?" + params.toString();
   if (location.hash !== next) {
+    state.writtenHash = next;
     history.replaceState(null, "", next);
   }
 }
@@ -717,6 +722,23 @@ async function applyInitialView() {
   }
 }
 
+// onHashchange re-applies the view for a pasted deep link or back/forward
+// navigation — but ONLY when the new hash is one we did not write ourselves.
+// Browsers have been observed firing hashchange for our own replaceState
+// fragment updates, and acting on those produced a live feedback loop:
+// clicking a log's trace id set #traces?...&trace_id, the event re-ran
+// applyInitialView, its trace search rewrote the hash without the trace id,
+// the waterfall restored it, and every write re-triggered the other — an
+// endless storm that left the view at the mercy of whichever call landed
+// last (the reported "sometimes the same link does not load"). writtenHash
+// is updated BEFORE replaceState precisely so even a synchronously-fired
+// event is recognised as ours.
+function onHashchange() {
+  if (!state.connected) return;
+  if (location.hash === state.writtenHash) return; // our own write, not navigation
+  applyInitialView();
+}
+
 // --- boot ---
 
 async function connect() {
@@ -771,13 +793,7 @@ function init() {
   document.getElementById("flush-btn").addEventListener("click", runFlush);
   document.getElementById("logout-btn").addEventListener("click", logout);
 
-  // A pasted deep link or back/forward navigation while already connected
-  // should re-apply, not sit ignored. setHash uses replaceState (no event),
-  // so this only fires for real navigations — no feedback loop with our own
-  // updates.
-  window.addEventListener("hashchange", () => {
-    if (state.connected) applyInitialView();
-  });
+  window.addEventListener("hashchange", onHashchange);
 
   // If a token is already stored (persists across tabs/restarts now — see
   // the top-of-file note on localStorage), skip the gate.
