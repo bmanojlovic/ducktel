@@ -178,19 +178,31 @@ function syncTenantPicker() {
   }
 }
 
-// --- services (for the traces filter dropdown) ---
+// --- services (for the traces and logs filter dropdowns) ---
 
 async function loadServices() {
-  const select = document.getElementById("f-service");
+  const tracesSelect = document.getElementById("f-service");
+  const logsSelect = document.getElementById("l-service");
   if (!state.tenant) {
-    select.innerHTML = `<option value="">any</option>`;
+    tracesSelect.innerHTML = `<option value="">any</option>`;
+    logsSelect.innerHTML = `<option value="">any</option>`;
     return;
   }
-  const resp = await api("/api/services?tenant=" + encodeURIComponent(state.tenant));
-  const services = resp.rows.map((r) => r.service_name).filter(Boolean);
-  select.innerHTML = `<option value="">any</option>` + services
-    .map((s) => `<option value="${escapeHtml(s)}">${escapeHtml(s)}</option>`)
-    .join("");
+  const tenant = encodeURIComponent(state.tenant);
+
+  // The two signals' service sets can differ; each dropdown asks for its own.
+  const [tr, lg] = await Promise.all([
+    api("/api/services?tenant=" + tenant),
+    api("/api/services?tenant=" + tenant + "&source=logs"),
+  ]);
+  const fill = (select, resp) => {
+    const services = resp.rows.map((r) => r.service_name).filter(Boolean);
+    select.innerHTML = `<option value="">any</option>` + services
+      .map((s) => `<option value="${escapeHtml(s)}">${escapeHtml(s)}</option>`)
+      .join("");
+  };
+  fill(tracesSelect, tr);
+  fill(logsSelect, lg);
 }
 
 // --- metric names (for the metrics form dropdown) ---
@@ -377,6 +389,79 @@ async function loadWaterfall(traceId) {
   wf.innerHTML = `<h3>Waterfall — ${escapeHtml(traceId)}</h3>` + rows.join("");
 }
 
+// --- logs view ---
+
+function severityClass(sev) {
+  const s = (sev || "").toUpperCase();
+  if (s === "ERROR" || s === "FATAL") return "status-error";
+  if (s === "WARN") return "sev-warn";
+  if (s === "DEBUG" || s === "TRACE") return "sev-dim";
+  return "";
+}
+
+// viewTrace jumps from a log row to its trace's waterfall: switches to the
+// traces tab and loads it under a clean traces hash (the log filters would
+// be meaningless there).
+function viewTrace(traceId) {
+  const params = new URLSearchParams();
+  params.set("tenant", state.tenant);
+  params.set("trace_id", traceId);
+  setHash("traces", params);
+  activateTab("traces");
+  loadWaterfall(traceId);
+}
+
+async function runLogSearch() {
+  if (!state.tenant) {
+    toast("no tenant selected — send some telemetry first", true);
+    return;
+  }
+  const params = new URLSearchParams();
+  params.set("tenant", state.tenant);
+  const service = document.getElementById("l-service").value;
+  if (service) params.set("service_name", service);
+  const severity = document.getElementById("l-severity").value;
+  if (severity) params.set("severity", severity);
+  const search = document.getElementById("l-search").value.trim();
+  if (search) params.set("search", search);
+  params.set("since_minutes", document.getElementById("l-since").value || "60");
+  params.set("limit", document.getElementById("l-limit").value || "100");
+
+  setHash("logs", params);
+
+  let resp;
+  try {
+    resp = await api("/api/logs?" + params.toString());
+  } catch (e) {
+    toast(e.message, true);
+    return;
+  }
+
+  const tbody = document.querySelector("#logs-table tbody");
+  tbody.innerHTML = "";
+
+  if (resp.rows.length === 0) {
+    tbody.innerHTML = `<tr><td colspan="5" class="empty">no log records matched</td></tr>`;
+    return;
+  }
+
+  resp.rows.forEach((r) => {
+    const tr = document.createElement("tr");
+    const traceId = r.trace_id || "";
+    tr.innerHTML = `
+      <td>${fmtTime(r.timestamp)}</td>
+      <td>${escapeHtml(r.service_name || "")}</td>
+      <td class="${severityClass(r.severity_text)}">${escapeHtml(r.severity_text || "")}</td>
+      <td class="log-body" title="${escapeHtml(r.body || "")}">${escapeHtml(r.body || "")}</td>
+      <td class="mono">${traceId ? escapeHtml(traceId.slice(0, 12)) + "…" : ""}</td>`;
+    if (traceId) {
+      tr.classList.add("clickable");
+      tr.addEventListener("click", () => viewTrace(traceId));
+    }
+    tbody.appendChild(tr);
+  });
+}
+
 // --- metrics view ---
 
 async function runMetricQuery() {
@@ -500,6 +585,19 @@ function fillTracesForm(params) {
   });
 }
 
+function fillLogsForm(params) {
+  const service = params.get("service_name");
+  if (service) document.getElementById("l-service").value = service;
+  const severity = params.get("severity");
+  if (severity) document.getElementById("l-severity").value = severity;
+  const search = params.get("search");
+  if (search) document.getElementById("l-search").value = search;
+  const since = params.get("since_minutes");
+  if (since) document.getElementById("l-since").value = since;
+  const limit = params.get("limit");
+  if (limit) document.getElementById("l-limit").value = limit;
+}
+
 function fillMetricsForm(params) {
   const name = params.get("metric_name");
   if (name) document.getElementById("m-name").value = name;
@@ -526,6 +624,15 @@ async function applyInitialView() {
     syncTenantPicker();
     await loadServices();
     await loadMetricNames();
+  }
+
+  if (view === "logs") {
+    activateTab("logs");
+    fillLogsForm(params);
+    if (state.tenant) {
+      await runLogSearch();
+    }
+    return;
   }
 
   if (view === "metrics") {
@@ -590,6 +697,10 @@ function init() {
   document.getElementById("traces-form").addEventListener("submit", (e) => {
     e.preventDefault();
     runTraceSearch();
+  });
+  document.getElementById("logs-form").addEventListener("submit", (e) => {
+    e.preventDefault();
+    runLogSearch();
   });
   document.getElementById("metrics-form").addEventListener("submit", (e) => {
     e.preventDefault();

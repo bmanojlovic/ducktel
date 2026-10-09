@@ -545,6 +545,190 @@ func TestMetricQueryAttrGroupByAndFilterCombined(t *testing.T) {
 	}
 }
 
+// --- log search ---
+
+// newLogCore seeds log records covering the filter dimensions: two tenants,
+// two services, three severities, distinguishable bodies, a record-level and
+// a resource-level attribute, and one record older than the default window.
+func newLogCore(t *testing.T) *Core {
+	t.Helper()
+	dir := t.TempDir()
+	w := writer.New(dir, time.Hour, 1000)
+
+	logRec := func(svc, tenant, sev, body, attrs string, ts time.Time) writer.LogRecord {
+		return writer.LogRecord{
+			Timestamp: ts.UnixMicro(), ObservedTimestamp: ts.UnixMicro(),
+			SeverityText: sev, SeverityNumber: 9, Body: body,
+			Attributes:         attrs,
+			ResourceAttributes: `{"service.name":"` + svc + `","tenant.id":"` + tenant + `"}`,
+			ServiceName:        svc,
+		}
+	}
+	now := time.Now()
+	w.AddLogs([]writer.LogRecord{
+		logRec("api", "acme", "ERROR", "connection refused to payments-db", `{"http.status_code":"500"}`, now.Add(-2*time.Minute)),
+		logRec("api", "acme", "INFO", "handled GET /products in 12ms", `{}`, now.Add(-3*time.Minute)),
+		logRec("worker", "acme", "WARN", "queue depth above threshold", `{"queue":"sync"}`, now.Add(-4*time.Minute)),
+		logRec("api", "globex", "ERROR", "globex-only failure", `{}`, now.Add(-1*time.Minute)),
+		logRec("nightly", "acme", "ERROR", "ancient failure", `{}`, now.Add(-48*time.Hour)),
+	})
+	if err := w.Flush(); err != nil {
+		t.Fatalf("seeding: %v", err)
+	}
+
+	engine, err := query.Open(dir)
+	if err != nil {
+		t.Fatalf("opening engine: %v", err)
+	}
+	t.Cleanup(func() { engine.Close() })
+	return NewCore(engine)
+}
+
+func TestSearchLogsTenantIsolation(t *testing.T) {
+	c := newLogCore(t)
+
+	// acme sees its 3 in-window records; globex's and the 48h-old one stay out.
+	rows, _, err := c.SearchLogs("acme", "", "", "", nil, 0, 0)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if n := len(rows); n != 3 {
+		t.Errorf("acme logs = %d rows, want 3 (globex or old leaked?)", n)
+	}
+	rows, _, _ = c.SearchLogs("globex", "", "", "", nil, 0, 0)
+	if n := len(rows); n != 1 {
+		t.Errorf("globex logs = %d rows, want 1", n)
+	}
+}
+
+func TestSearchLogsNewestFirst(t *testing.T) {
+	c := newLogCore(t)
+
+	rows, _, err := c.SearchLogs("acme", "", "", "", nil, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := rows[0]["body"].(string); got != "connection refused to payments-db" {
+		t.Errorf("first row = %q, want the newest record", got)
+	}
+}
+
+func TestSearchLogsSeverityCaseInsensitive(t *testing.T) {
+	c := newLogCore(t)
+
+	for _, sev := range []string{"error", "ERROR", "Error"} {
+		rows, _, err := c.SearchLogs("acme", "", sev, "", nil, 0, 0)
+		if err != nil {
+			t.Fatalf("severity %q: %v", sev, err)
+		}
+		if n := len(rows); n != 1 {
+			t.Errorf("severity %q matched %d rows, want 1", sev, n)
+		}
+	}
+}
+
+func TestSearchLogsBodySearchCaseInsensitive(t *testing.T) {
+	c := newLogCore(t)
+
+	for _, q := range []string{"refused", "REFUSED", "connection"} {
+		rows, _, err := c.SearchLogs("acme", "", "", q, nil, 0, 0)
+		if err != nil {
+			t.Fatalf("search %q: %v", q, err)
+		}
+		if n := len(rows); n != 1 {
+			t.Errorf("search %q matched %d rows, want 1", q, n)
+		}
+	}
+}
+
+func TestSearchLogsServiceAndCombinedFilters(t *testing.T) {
+	c := newLogCore(t)
+
+	rows, _, err := c.SearchLogs("acme", "worker", "", "", nil, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := len(rows); n != 1 {
+		t.Errorf("service=worker matched %d rows, want 1", n)
+	}
+
+	// severity AND service together: the api ERROR, not the worker WARN.
+	rows, _, _ = c.SearchLogs("acme", "api", "ERROR", "", nil, 0, 0)
+	if n := len(rows); n != 1 {
+		t.Errorf("api+ERROR matched %d rows, want 1", n)
+	}
+	if got := rows[0]["service_name"].(string); got != "api" {
+		t.Errorf("combined filter returned service %q", got)
+	}
+}
+
+func TestSearchLogsAttributeFilters(t *testing.T) {
+	c := newLogCore(t)
+
+	// Record-level attribute.
+	rows, _, err := c.SearchLogs("acme", "", "", "", []AttrFilter{{Key: "http.status_code", Value: "500"}}, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := len(rows); n != 1 {
+		t.Errorf("record-attr filter matched %d rows, want 1", n)
+	}
+
+	// Resource-level attribute through the same filter (dual scope).
+	rows, _, _ = c.SearchLogs("acme", "", "", "", []AttrFilter{{Key: "service.name", Value: "worker"}}, 0, 0)
+	if n := len(rows); n != 1 {
+		t.Errorf("resource-attr filter matched %d rows, want 1", n)
+	}
+
+	// Injection-shaped value stays data.
+	rows, _, _ = c.SearchLogs("acme", "", "", "", []AttrFilter{{Key: "http.status_code", Value: "500' OR '1'='1"}}, 0, 0)
+	if n := len(rows); n != 0 {
+		t.Errorf("injection filter matched %d rows, want 0", n)
+	}
+
+	// Empty key is rejected.
+	_, _, err = c.SearchLogs("acme", "", "", "", []AttrFilter{{Key: "", Value: "x"}}, 0, 0)
+	if err == nil {
+		t.Error("empty filter key should error")
+	}
+}
+
+func TestSearchLogsWiderWindowIncludesOld(t *testing.T) {
+	c := newLogCore(t)
+
+	rows, _, _ := c.SearchLogs("acme", "", "", "ancient", nil, 0, 0)
+	if n := len(rows); n != 0 {
+		t.Errorf("48h-old log leaked into the default window: %d rows", n)
+	}
+	rows, _, err := c.SearchLogs("acme", "", "", "ancient", nil, 7*24*60, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := len(rows); n != 1 {
+		t.Errorf("explicit 7d window returned %d rows, want 1", n)
+	}
+}
+
+func TestSearchLogsLimitIsCapped(t *testing.T) {
+	c := newLogCore(t)
+
+	rows, _, err := c.SearchLogs("acme", "", "", "", nil, 0, 100000)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if n := len(rows); n != 3 {
+		t.Errorf("got %d rows, want 3", n)
+	}
+}
+
+func TestSearchLogsRequiresTenant(t *testing.T) {
+	c := newLogCore(t)
+
+	if _, _, err := c.SearchLogs("", "", "", "", nil, 0, 0); err == nil {
+		t.Error("missing tenant should error")
+	}
+}
+
 // --- injection resistance at the query boundary ---
 
 // TestFiltersCannotInjectSQL verifies attribute keys and values are bound, not
@@ -620,6 +804,31 @@ func TestListServicesRequiresTenant(t *testing.T) {
 	_, _, err := c.ListServices("")
 	if err == nil {
 		t.Error("ListServices without tenant should error")
+	}
+}
+
+func TestListLogServices(t *testing.T) {
+	c := newLogCore(t)
+
+	rows, _, err := c.ListLogServices("acme")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	got := map[string]bool{}
+	for _, r := range rows {
+		got[r["service_name"].(string)] = true
+	}
+	// api, worker, nightly — the 48h-old record's service counts too (the
+	// list has no time filter), and globex's api must not leak.
+	if !got["api"] || !got["worker"] || !got["nightly"] {
+		t.Errorf("ListLogServices(acme) = %v, want api, worker, nightly", rows)
+	}
+	if len(rows) != 3 {
+		t.Errorf("ListLogServices(acme) returned %d services, want exactly 3", len(rows))
+	}
+
+	if _, _, err := c.ListLogServices(""); err == nil {
+		t.Error("ListLogServices without tenant should error")
 	}
 }
 

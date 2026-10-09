@@ -45,6 +45,14 @@ func newTestServer(t *testing.T) *sdkmcp.ClientSession {
 		seedSpan("api", "acme", "trace-acme-1"),
 		seedSpan("worker", "acme", "trace-acme-2"),
 	})
+	w.AddLogs([]writer.LogRecord{
+		{Timestamp: time.Now().UnixMicro(), ServiceName: "api", SeverityText: "ERROR",
+			Body: "connection refused", Attributes: "{}",
+			ResourceAttributes: `{"service.name":"api","tenant.id":"acme"}`},
+		{Timestamp: time.Now().UnixMicro(), ServiceName: "api", SeverityText: "INFO",
+			Body: "handled request", Attributes: "{}",
+			ResourceAttributes: `{"service.name":"api","tenant.id":"acme"}`},
+	})
 	if err := w.Flush(); err != nil {
 		t.Fatalf("seeding: %v", err)
 	}
@@ -118,7 +126,7 @@ func TestToolsAreRegistered(t *testing.T) {
 			t.Errorf("tool %q has no description — models need it to discriminate", tool.Name)
 		}
 	}
-	for _, want := range []string{"trace_lookup", "span_search", "metric_query"} {
+	for _, want := range []string{"trace_lookup", "span_search", "log_search", "metric_query"} {
 		if !got[want] {
 			t.Errorf("tool %q not registered", want)
 		}
@@ -190,5 +198,26 @@ func TestMetricQueryAdapterPropagatesCoreValidationError(t *testing.T) {
 	body, isErr := call(t, s, "metric_query", map[string]any{"tenant": "acme", "aggregation": "avg"})
 	if !isErr {
 		t.Errorf("metric_query without metric_name should error, got: %s", body)
+	}
+}
+
+func TestLogSearchAdapterHappyPath(t *testing.T) {
+	s := newTestServer(t)
+
+	body, isErr := call(t, s, "log_search", map[string]any{"tenant": "acme", "severity": "error"})
+	if isErr {
+		t.Fatalf("unexpected error: %s", body)
+	}
+	if n := countRows(t, body); n != 1 {
+		t.Errorf("got %d rows, want the single ERROR record\n%s", n, body)
+	}
+}
+
+func TestLogSearchAdapterPropagatesCoreValidationError(t *testing.T) {
+	s := newTestServer(t)
+
+	body, isErr := call(t, s, "log_search", map[string]any{})
+	if !isErr {
+		t.Errorf("log_search without tenant should error, got: %s", body)
 	}
 }

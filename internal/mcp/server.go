@@ -53,6 +53,16 @@ func (s *Server) Register(srv *sdkmcp.Server) {
 	}, s.spanSearch)
 
 	sdkmcp.AddTool(srv, &sdkmcp.Tool{
+		Name: "log_search",
+		Description: "Find log records matching filters within a time range, newest first. " +
+			"Use this for what a service actually logged — error messages, warnings, " +
+			"failure detail. Filter by service, exact severity (case-insensitive), a " +
+			"substring of the body, or attribute key/value pairs. Records that carry " +
+			"trace_id/span_id can be joined to spans to see a failure's log line next " +
+			"to its trace.",
+	}, s.logSearch)
+
+	sdkmcp.AddTool(srv, &sdkmcp.Tool{
 		Name: "metric_query",
 		Description: "Aggregate a metric over a time range, optionally grouped by a column. " +
 			"Use this for numeric questions — request rates, resource utilisation, " +
@@ -139,6 +149,31 @@ func (s *Server) spanSearch(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 	}
 
 	rows, cols, err := s.core.SearchSpans(args.Tenant, args.ServiceName, filters, args.SinceMinutes, args.Limit)
+	if err != nil {
+		return errResult(err.Error())
+	}
+	return rowsResult(rows, cols)
+}
+
+// --- log_search ---
+
+type logSearchArgs struct {
+	Tenant       string       `json:"tenant" jsonschema:"the tenant to query; only data for this tenant is returned"`
+	ServiceName  string       `json:"service_name,omitempty" jsonschema:"restrict to one service name"`
+	Severity     string       `json:"severity,omitempty" jsonschema:"exact severity to match, case-insensitive: DEBUG, INFO, WARN, ERROR, FATAL. Matches the severity text senders set."`
+	Search       string       `json:"search,omitempty" jsonschema:"case-insensitive substring to find in the log body"`
+	Filters      []attrFilter `json:"filters,omitempty" jsonschema:"attribute key/value pairs to match (ANDed together), against record attributes OR resource attributes. Omit to match all records in the time range."`
+	SinceMinutes int          `json:"since_minutes,omitempty" jsonschema:"how far back to search, in minutes. Default 60."`
+	Limit        int          `json:"limit,omitempty" jsonschema:"maximum log records to return, default 100. Cap 1000."`
+}
+
+func (s *Server) logSearch(ctx context.Context, req *sdkmcp.CallToolRequest, args logSearchArgs) (*sdkmcp.CallToolResult, any, error) {
+	filters := make([]telemetry.AttrFilter, len(args.Filters))
+	for i, f := range args.Filters {
+		filters[i] = telemetry.AttrFilter{Key: f.Key, Value: f.Value}
+	}
+
+	rows, cols, err := s.core.SearchLogs(args.Tenant, args.ServiceName, args.Severity, args.Search, filters, args.SinceMinutes, args.Limit)
 	if err != nil {
 		return errResult(err.Error())
 	}

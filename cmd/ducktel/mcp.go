@@ -43,6 +43,7 @@ metrics and time, and nothing about what any attribute means:
 
   trace_lookup(trace_id)                all spans of one trace
   span_search(filters, time_range)      spans matching arbitrary attribute filters
+  log_search(severity, search, ...)     log records matching body/severity/attribute filters
   metric_query(name, aggregation, ...)  metric aggregation over a range
   flush_buffer()                        make just-received telemetry queryable now
 

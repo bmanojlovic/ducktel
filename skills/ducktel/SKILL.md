@@ -164,14 +164,15 @@ List distinct service names from traces.
 
 Serve telemetry queries over the Model Context Protocol, for agent consumers.
 
-Four generic, domain-agnostic tools. They know about spans, attributes, metrics and
-time, and attach no meaning to any attribute key — domain interpretation is the
-caller's job.
+Five generic, domain-agnostic tools. They know about spans, attributes, logs,
+metrics and time, and attach no meaning to any attribute key — domain
+interpretation is the caller's job.
 
 | Tool | Purpose |
 |------|---------|
 | `trace_lookup(trace_id, tenant)` | every span of one trace, ordered by start time |
 | `span_search(filters, service_name, since_minutes, tenant, limit)` | spans matching attribute key/value filters |
+| `log_search(severity, search, service_name, filters, since_minutes, tenant, limit)` | log records, newest first: exact case-insensitive severity, body substring, attribute filters |
 | `metric_query(metric_name, aggregation, since_minutes, group_by, tenant, filters)` | metric aggregation: avg, sum, min, max, count, p50, p95, p99 |
 | `flush_buffer()` | make just-received telemetry queryable now (see Flush semantics) |
 

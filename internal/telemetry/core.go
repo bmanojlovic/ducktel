@@ -164,6 +164,68 @@ func (c *Core) SearchSpans(tenant, serviceName string, filters []AttrFilter, sin
 	return c.engine.Query(q, params...)
 }
 
+// SearchLogs finds log records matching filters within a time range, scoped
+// to tenant — the log-signal counterpart of SearchSpans, with the same
+// filter semantics: an exact service name, a case-insensitive exact severity
+// (matched against severity_text, which senders set alongside
+// severity_number), a case-insensitive body substring, and attribute filters
+// matched against record attributes OR resource attributes. Results are
+// newest first.
+func (c *Core) SearchLogs(tenant, serviceName, severity, search string, filters []AttrFilter, sinceMinutes, limit int) ([]map[string]any, []string, error) {
+	if err := validateTenant(tenant); err != nil {
+		return nil, nil, err
+	}
+
+	if limit <= 0 {
+		limit = 100
+	}
+	if limit > 1000 {
+		limit = 1000
+	}
+	since := sinceMinutes
+	if since <= 0 {
+		since = 60
+	}
+	cutoff := time.Now().Add(-time.Duration(since) * time.Minute).UnixMicro()
+
+	conds := []string{"timestamp >= ?", c.tenantPredicate()}
+	params := []any{cutoff, tenant}
+
+	if serviceName != "" {
+		conds = append(conds, "service_name = ?")
+		params = append(params, serviceName)
+	}
+	if severity != "" {
+		conds = append(conds, "UPPER(severity_text) = ?")
+		params = append(params, strings.ToUpper(severity))
+	}
+	if search != "" {
+		conds = append(conds, "body ILIKE ?")
+		params = append(params, "%"+search+"%")
+	}
+	for _, f := range filters {
+		if f.Key == "" {
+			return nil, nil, invalidInput("attribute filter key must not be empty")
+		}
+		// Dual-scope like SearchSpans: the caller should not need to know
+		// whether a key lives in the record's own attributes or its resource
+		// attributes.
+		conds = append(conds,
+			"(json_extract_string(attributes, ?) = ? OR json_extract_string(resource_attributes, ?) = ?)")
+		params = append(params, jsonPath(f.Key), f.Value, jsonPath(f.Key), f.Value)
+	}
+
+	params = append(params, limit)
+	q := `SELECT timestamp, service_name, severity_text, severity_number,
+	             body, trace_id, span_id, attributes
+	      FROM logs
+	      WHERE ` + strings.Join(conds, " AND ") + `
+	      ORDER BY timestamp DESC
+	      LIMIT ?`
+
+	return c.engine.Query(q, params...)
+}
+
 // metricGroupKeys splits a group_by string into individual keys: comma-
 // separated, whitespace-trimmed, empty parts dropped. An empty group_by means
 // no grouping at all.
@@ -320,6 +382,19 @@ func (c *Core) ListServices(tenant string) ([]map[string]any, []string, error) {
 		return nil, nil, err
 	}
 	q := `SELECT DISTINCT service_name FROM traces WHERE ` + c.tenantPredicate() + ` ORDER BY 1`
+	return c.engine.Query(q, tenant)
+}
+
+// ListLogServices returns distinct service names within one tenant as seen
+// in the LOG signal. Separate from ListServices because the two signals'
+// service sets can differ — a service that only ships logs would be missing
+// from a traces-derived list, and the dashboard's log filter would then
+// silently offer the wrong options.
+func (c *Core) ListLogServices(tenant string) ([]map[string]any, []string, error) {
+	if err := validateTenant(tenant); err != nil {
+		return nil, nil, err
+	}
+	q := `SELECT DISTINCT service_name FROM logs WHERE ` + c.tenantPredicate() + ` ORDER BY 1`
 	return c.engine.Query(q, tenant)
 }
 

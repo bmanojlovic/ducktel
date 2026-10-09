@@ -39,6 +39,7 @@ func (h *Handlers) Register(mux *http.ServeMux) {
 	}
 	mux.Handle("GET /api/traces", auth(h.handleSearchSpans))
 	mux.Handle("GET /api/traces/{trace_id}", auth(h.handleLookupTrace))
+	mux.Handle("GET /api/logs", auth(h.handleSearchLogs))
 	mux.Handle("GET /api/metrics", auth(h.handleQueryMetric))
 	mux.Handle("GET /api/tenants", auth(h.handleListTenants))
 	mux.Handle("GET /api/services", auth(h.handleListServices))
@@ -119,6 +120,31 @@ func (h *Handlers) handleSearchSpans(w http.ResponseWriter, r *http.Request) {
 	writeRows(w, rows, cols)
 }
 
+func (h *Handlers) handleSearchLogs(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+
+	// Same repeated ?filter=key:value pairs as the span search endpoint.
+	var filters []telemetry.AttrFilter
+	for _, raw := range q["filter"] {
+		key, value, ok := strings.Cut(raw, ":")
+		if !ok {
+			http.Error(w, fmt.Sprintf("filter %q must be key:value", raw), http.StatusBadRequest)
+			return
+		}
+		filters = append(filters, telemetry.AttrFilter{Key: key, Value: value})
+	}
+
+	rows, cols, err := h.core.SearchLogs(
+		q.Get("tenant"), q.Get("service_name"), q.Get("severity"), q.Get("search"), filters,
+		queryInt(r, "since_minutes", 0), queryInt(r, "limit", 0),
+	)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeRows(w, rows, cols)
+}
+
 func (h *Handlers) handleLookupTrace(w http.ResponseWriter, r *http.Request) {
 	traceID := r.PathValue("trace_id")
 	q := r.URL.Query()
@@ -167,7 +193,21 @@ func (h *Handlers) handleListTenants(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handlers) handleListServices(w http.ResponseWriter, r *http.Request) {
-	rows, cols, err := h.core.ListServices(r.URL.Query().Get("tenant"))
+	q := r.URL.Query()
+
+	// ?source=logs lists services seen in the log signal instead of traces;
+	// the two sets can differ, and the dashboard's log filter needs the
+	// logs-derived one.
+	var (
+		rows []map[string]any
+		cols []string
+		err  error
+	)
+	if q.Get("source") == "logs" {
+		rows, cols, err = h.core.ListLogServices(q.Get("tenant"))
+	} else {
+		rows, cols, err = h.core.ListServices(q.Get("tenant"))
+	}
 	if err != nil {
 		writeErr(w, err)
 		return

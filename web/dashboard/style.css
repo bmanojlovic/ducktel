@@ -151,6 +151,19 @@ select, input[type=text], input[type=number], input[type=password] {
 .status-error { color: var(--err); }
 .status-unset { color: var(--muted); }
 
+/* severity colours for the logs table: red for error/fatal (status-error),
+   amber for warn, dimmed for debug/trace */
+.sev-warn { color: var(--accent); }
+.sev-dim { color: var(--muted); }
+
+.log-body {
+  max-width: 560px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+tr.clickable td:last-child { text-decoration: underline; }
+
 /* --- waterfall --- */
 
 .waterfall {
