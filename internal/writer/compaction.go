@@ -17,22 +17,35 @@ import (
 // recognises its own output by this exact name.
 const mergedName = "day.parquet"
 
-// compactOldDays merges each past day's per-flush parquet files into one
-// day.parquet per signal. A day directory is frozen once its UTC date has
-// passed — the writer only ever writes today's directory — so compaction
-// never races a live write. Sources merge in name order, which is
+// compactOldDays merges each old day's per-flush parquet files into one
+// day.parquet per signal. Sources merge in name order, which is
 // chronological (HH-MM[-n]), so the merged file's row-group statistics make
 // timestamp filters prune well.
+//
+// Only days at least a full calendar day in the past are touched — strictly
+// before yesterday (UTC). Yesterday itself is deliberately out of scope:
+// writeParquet picks its directory from the wall clock when a flush STARTS,
+// and flushes run from HTTP handlers and the buffer threshold as well as the
+// writer's own loop, so a flush begun at 23:59:59 lands its file in
+// yesterday's directory moments after midnight. Compacting on "any day that
+// has ended" made that file a racing write — it appeared after the merge and
+// the next pass deleted it as a stale leftover, silently losing a flush.
+// The day-margin makes such a file at least a day old before its directory
+// is eligible, so no live write can still be in flight. (A lock around flush
+// writes was the alternative; writeParquet deliberately runs without w.mu so
+// ingest never blocks behind disk I/O, and the margin preserves that.)
 //
 // Crash safety: if day.parquet already exists, the previous merge's rename
 // completed and any remaining per-flush files are leftovers of a crash
 // between rename and delete — they are deleted, never merged (merging them
 // would double the rows). Otherwise the sources merge into a temp file that
 // is fsync'd and renamed into place before the originals are removed; a
-// crash before the rename leaves only a stray temp file, removed on the next
-// run.
+// crash before the rename leaves a stray .tmp-* file, swept once old enough
+// by sweepOrphanedTemps.
 func (w *Writer) compactOldDays() error {
-	today := time.Now().UTC().Format("2006-01-02")
+	// Eligible: strictly older than yesterday. AddDate(-1) gives yesterday's
+	// date, so `< cutoff` means today-2 and earlier.
+	cutoff := time.Now().UTC().AddDate(0, 0, -1).Format("2006-01-02")
 
 	var firstErr error
 	for _, signal := range signalDirs {
@@ -54,8 +67,8 @@ func (w *Writer) compactOldDays() error {
 			if _, err := time.ParseInLocation("2006-01-02", d.Name(), time.UTC); err != nil {
 				continue // not a date-shaped directory — never touch it
 			}
-			if d.Name() >= today {
-				continue // today (or a clock-skewed future day) is the writer's
+			if d.Name() >= cutoff {
+				continue // today or yesterday (or a clock-skewed future day)
 			}
 			if err := compactDayDir(signalDir, d.Name(), signal); err != nil {
 				if firstErr == nil {
@@ -67,10 +80,51 @@ func (w *Writer) compactOldDays() error {
 	return firstErr
 }
 
+// tempSweepAge is how old a stray .tmp-* file must be before compaction
+// removes it. A naming convention writeParquet also uses for its in-flight
+// temp file, so the age guard leaves a genuinely live write alone even if the
+// day-margin reasoning above were ever wrong.
+const tempSweepAge = time.Hour
+
+// sweepOrphanedTemps removes .tmp-* files older than tempSweepAge from dir.
+// writeParquet's deferred os.Remove covers failures, but a crash between
+// CreateTemp and rename — or between rename and the deferred Remove — leaves
+// one behind, and with retention off nothing else would ever clean it up.
+func sweepOrphanedTemps(dir string) error {
+	temps, err := filepath.Glob(filepath.Join(dir, ".tmp-*"))
+	if err != nil {
+		return err
+	}
+	ageCutoff := time.Now().Add(-tempSweepAge)
+	for _, tmp := range temps {
+		info, err := os.Stat(tmp)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue // already gone (raced a concurrent sweep)
+			}
+			return fmt.Errorf("stating %s: %w", tmp, err)
+		}
+		if info.ModTime().After(ageCutoff) {
+			continue // young: a live write may still own it
+		}
+		if err := os.Remove(tmp); err != nil {
+			return fmt.Errorf("removing orphaned temp %s: %w", tmp, err)
+		}
+		log.Printf("compaction: removed orphaned temp %s", tmp)
+	}
+	return nil
+}
+
 // compactDayDir merges one day directory's per-flush files for one signal.
+// The caller only reaches this for days strictly older than yesterday, so no
+// live write can still be landing here.
 func compactDayDir(signalDir, day, signal string) error {
 	dayDir := filepath.Join(signalDir, day)
 	merged := filepath.Join(dayDir, mergedName)
+
+	if err := sweepOrphanedTemps(dayDir); err != nil {
+		return err
+	}
 
 	sources, err := filepath.Glob(filepath.Join(dayDir, "*.parquet"))
 	if err != nil {

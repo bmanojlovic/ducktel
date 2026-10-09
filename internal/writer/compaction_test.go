@@ -140,6 +140,102 @@ func TestCompactLeftoversDeletedNotMerged(t *testing.T) {
 	}
 }
 
+// yesterdayDir returns (and creates) the day directory the day-margin exists
+// to protect: a flush straddling midnight lands files here just after its
+// date has passed.
+func yesterdayDir(t *testing.T, dataDir, signal string) string {
+	t.Helper()
+	dir := filepath.Join(dataDir, signal, time.Now().UTC().AddDate(0, 0, -1).Format("2006-01-02"))
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return dir
+}
+
+// TestCompactSkipsYesterday pins the day-margin: per-flush files in
+// yesterday's directory must not be merged yet, because a flush begun before
+// midnight may still be landing into it.
+func TestCompactSkipsYesterday(t *testing.T) {
+	dataDir := t.TempDir()
+	dayDir := yesterdayDir(t, dataDir, "traces")
+	writeSourceFile(t, filepath.Join(dayDir, "23-59.parquet"), spanN(1, "late"))
+	writeSourceFile(t, filepath.Join(dayDir, "23-59-1.parquet"), spanN(1, "later"))
+
+	w := New(dataDir, time.Hour, 1000)
+	if err := w.compactOldDays(); err != nil {
+		t.Fatalf("compactOldDays: %v", err)
+	}
+
+	files := parquetFilesSorted(t, dayDir)
+	if len(files) != 2 || files[0] != "23-59-1.parquet" || files[1] != "23-59.parquet" {
+		t.Errorf("yesterday was touched: %v", files)
+	}
+}
+
+// TestCompactDoesNotDeleteFlushLandingAfterMidnight is the regression for the
+// midnight race: a flush started at 23:59:59 writes into yesterday's
+// directory and renames after midnight, by which time a naive compaction
+// (anything "past") would have merged the directory and would delete this
+// file as a stale leftover on its next pass — losing the flush. With the
+// day-margin, yesterday's directory is never compacted and the file survives
+// the leftover rule.
+func TestCompactDoesNotDeleteFlushLandingAfterMidnight(t *testing.T) {
+	dataDir := t.TempDir()
+	dayDir := yesterdayDir(t, dataDir, "traces")
+	writeSourceFile(t, filepath.Join(dayDir, "day.parquet"), spanN(1, "merged-earlier"))
+	// The straddling flush's file, appearing after day.parquet already exists.
+	straddler := filepath.Join(dayDir, "23-59.parquet")
+	writeSourceFile(t, straddler, spanN(2, "straddler"))
+
+	w := New(dataDir, time.Hour, 1000)
+	if err := w.compactOldDays(); err != nil {
+		t.Fatalf("compactOldDays: %v", err)
+	}
+
+	if _, err := os.Stat(straddler); err != nil {
+		t.Fatalf("the post-midnight flush's file was deleted — silent data loss: %v", err)
+	}
+	if rows := readAll[TraceSpan](t, straddler); len(rows) != 2 {
+		t.Errorf("straddler has %d rows, want 2", len(rows))
+	}
+}
+
+// TestCompactSweepsOrphanedTemps covers the second review finding: a crash
+// between CreateTemp and rename (or rename and the deferred Remove) leaves a
+// .tmp-* file that nothing else cleans up. Compaction sweeps stale ones from
+// the directories it visits, while leaving young ones (a live write's) alone.
+func TestCompactSweepsOrphanedTemps(t *testing.T) {
+	dataDir := t.TempDir()
+	dayDir := oldDayDir(t, dataDir, "traces")
+	writeSourceFile(t, filepath.Join(dayDir, "10-00.parquet"), spanN(1, "a"))
+
+	orphan := filepath.Join(dayDir, ".tmp-orphan")
+	if err := os.WriteFile(orphan, []byte("partial"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-2 * time.Hour)
+	if err := os.Chtimes(orphan, old, old); err != nil {
+		t.Fatal(err)
+	}
+
+	fresh := filepath.Join(dayDir, ".tmp-fresh")
+	if err := os.WriteFile(fresh, []byte("in-flight"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	w := New(dataDir, time.Hour, 1000)
+	if err := w.compactOldDays(); err != nil {
+		t.Fatalf("compactOldDays: %v", err)
+	}
+
+	if _, err := os.Stat(orphan); !os.IsNotExist(err) {
+		t.Errorf("old orphaned temp file should be swept: %v", err)
+	}
+	if _, err := os.Stat(fresh); err != nil {
+		t.Errorf("young temp file must be left alone (a live write may own it): %v", err)
+	}
+}
+
 func TestCompactSkipsTodayAndNonDateDirs(t *testing.T) {
 	dataDir := t.TempDir()
 	todayDir := filepath.Join(dataDir, "traces", time.Now().UTC().Format("2006-01-02"))
