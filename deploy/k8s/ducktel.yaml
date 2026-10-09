@@ -62,9 +62,9 @@ spec:
             # response: unbounded Parquet growth (a file per flush, no
             # compaction) made any metrics query scan tens of thousands of
             # files and OOM the 2Gi mcp container (exit 137, twice in one
-            # evening). A week keeps several nights of
-            # telemetry. Adjust the window deliberately, not casually —
-            # queries over the retained range are what cost memory.
+            # evening). A week keeps several nights of telemetry.
+            # Adjust the window deliberately, not casually — queries over
+            # the retained range are what cost memory.
             - --retention
             - 7d
           ports:

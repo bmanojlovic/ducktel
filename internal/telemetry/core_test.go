@@ -346,7 +346,7 @@ func TestMetricQueryRequiresName(t *testing.T) {
 // --- attr.<key> group_by ---
 
 // newAttrMetricCore seeds metric points carrying data-point attributes, the
-// shape a nightly-batch pipeline's telemetry actually uses (kind gen|judge, backend
+// shape a nightly-batch pipeline's telemetry uses (kind gen|judge, backend
 // local|alibaba), plus one point from another tenant to prove isolation
 // still holds through the new grouping path.
 func newAttrMetricCore(t *testing.T) *Core {
