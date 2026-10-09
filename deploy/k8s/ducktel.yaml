@@ -1,5 +1,10 @@
 # ducktel — OTLP receiver + Parquet storage + DuckDB query.
 #
+# REFERENCE ONLY. The running deployment is installed and updated by an
+# external Terraform codebase; this directory is kept in the repo to document
+# the intended shape, and must never be applied with kubectl. Change the
+# Terraform source instead, and keep these files in sync with it.
+#
 # Two containers share one pod and one data volume:
 #   otlp  receives telemetry on 4318 (write side; token held by senders)
 #   mcp   serves queries on 4319    (read side;  token held by consumers)

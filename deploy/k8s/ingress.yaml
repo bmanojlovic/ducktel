@@ -1,5 +1,8 @@
 # Ingress for the OTLP receiver.
 #
+# REFERENCE ONLY — the running deployment is installed and updated by an
+# external Terraform codebase; never apply this file with kubectl.
+#
 # Two hostnames, two issuers, therefore TWO routers: a Traefik router serves one
 # certificate (its tls.secretName), so a single router covering both hosts can
 # only present one of them — the other falls back to Traefik's default

@@ -1,5 +1,8 @@
 # Internal CA for cluster-internal names.
 #
+# REFERENCE ONLY — the running deployment is installed and updated by an
+# external Terraform codebase; never apply this file with kubectl.
+#
 # otel.steki.org is not publicly resolvable (LAN/VPN only), so ACME HTTP-01
 # cannot validate it — verified: in one Certificate covering both names, the
 # challenge for otel.ext.steki.org went valid while otel.steki.org stayed
