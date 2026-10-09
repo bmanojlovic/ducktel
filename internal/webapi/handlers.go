@@ -56,9 +56,15 @@ type rowsResponse struct {
 
 // writeRows sanitizes non-finite float values (NaN/Inf from a metric
 // aggregate) before marshaling — encoding/json fails outright on those,
-// unlike MCP's MarshalRows, which degrades them to null per-cell.
+// unlike MCP's MarshalRows, which degrades them to null per-cell. It also
+// normalises a nil slice to an empty one, so a query that matched nothing
+// serialises as "rows":[] rather than "rows":null — a client iterating the
+// result should never have to special-case an empty set.
 func writeRows(w http.ResponseWriter, rows []map[string]any, cols []string) {
 	rows = telemetry.SanitizeRows(rows)
+	if rows == nil {
+		rows = []map[string]any{}
+	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(rowsResponse{Columns: cols, Rows: rows})
 }

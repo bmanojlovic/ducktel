@@ -76,8 +76,16 @@ async function api(path, opts) {
     throw new Error(body || (res.status + " " + res.statusText));
   }
   const ct = res.headers.get("Content-Type") || "";
-  if (ct.includes("application/json")) return res.json();
-  return null;
+  if (!ct.includes("application/json")) return null;
+
+  const body = await res.json();
+  // A query that matched nothing used to serialize as "rows":null (Go's nil
+  // slice), and every caller here iterates rows — one null crashed the whole
+  // post-login load with no visible error. The server now always sends []
+  // for an empty result, but normalise here too so an older server can never
+  // brick the UI again.
+  if (body && body.rows === null) body.rows = [];
+  return body;
 }
 
 function showGate(errorMsg) {
@@ -104,9 +112,17 @@ function toast(msg, isErr) {
 
 // --- tenant resolution ---
 //
-// This is realistically a one-tenant system today. The picker only appears
-// if there's genuinely more than one — otherwise tenant selection would be a
-// pointless extra click on every load.
+// The picker only appears if there's genuinely more than one tenant.
+// With several (test tenants alongside the real one), the previously
+// chosen tenant is remembered and restored, because defaulting to
+// whichever sorts first is almost never the one you want.
+
+const TENANT_KEY = "ducktel_tenant";
+
+function preferredTenant() {
+  const saved = localStorage.getItem(TENANT_KEY);
+  return saved && state.tenants.includes(saved) ? saved : state.tenants[0];
+}
 
 async function resolveTenant() {
   const resp = await api("/api/tenants");
@@ -132,14 +148,16 @@ async function resolveTenant() {
     return;
   }
 
-  // More than one — show the picker, the multi-tenant future.
+  // More than one — show the picker. Prefer the last tenant this browser
+  // used, then fall back to the first alphabetically.
   label.classList.add("hidden");
   wrap.classList.remove("hidden");
   select.innerHTML = state.tenants.map((t) => `<option value="${escapeHtml(t)}">${escapeHtml(t)}</option>`).join("");
-  state.tenant = state.tenants[0];
+  state.tenant = preferredTenant();
   select.value = state.tenant;
   select.onchange = async () => {
     state.tenant = select.value;
+    localStorage.setItem(TENANT_KEY, state.tenant);
     await loadServices();
     await loadMetricNames();
     await runTraceSearch();
@@ -443,6 +461,9 @@ async function runFlush() {
 // clear a stored token is a 401 or manually clearing browser storage.
 function logout() {
   clearToken();
+  // Also forget the remembered tenant: logout is an explicit hand-over of
+  // the browser, so the next person starts at the default.
+  localStorage.removeItem(TENANT_KEY);
   state.tenant = null;
   state.tenants = [];
   state.connected = false;
@@ -501,6 +522,7 @@ async function applyInitialView() {
   const hashTenant = params.get("tenant");
   if (hashTenant && state.tenants.includes(hashTenant) && hashTenant !== state.tenant) {
     state.tenant = hashTenant;
+    localStorage.setItem(TENANT_KEY, state.tenant);
     syncTenantPicker();
     await loadServices();
     await loadMetricNames();

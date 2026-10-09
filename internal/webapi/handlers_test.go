@@ -193,6 +193,30 @@ func TestListMetricNamesMissingTenantIs400(t *testing.T) {
 	}
 }
 
+// TestEmptyResultSerializesAsArray pins the fix for a real dashboard
+// regression: a query matching nothing used to serialize as "rows":null
+// (Go's nil slice), and any client iterating the result crashed on it — the
+// dashboard's first load silently died when the auto-selected tenant had no
+// spans in the default window. An empty result must be [], never null.
+func TestEmptyResultSerializesAsArray(t *testing.T) {
+	mux := newTestMux(t, "")
+
+	rec := doReq(t, mux, "GET", "/api/traces?tenant=no-such-tenant", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d: %s", rec.Code, rec.Body.String())
+	}
+	var resp rowsResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("bad JSON: %v", err)
+	}
+	if resp.Rows == nil {
+		t.Error(`empty result serialized as null; must be [] so clients can iterate without special-casing`)
+	}
+	if len(resp.Rows) != 0 {
+		t.Errorf("expected 0 rows, got %d", len(resp.Rows))
+	}
+}
+
 func TestListTenantsReturnsBoth(t *testing.T) {
 	mux := newTestMux(t, "")
 
