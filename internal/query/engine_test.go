@@ -1,8 +1,11 @@
 package query
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
 	"testing"
 
 	"github.com/davidgeorgehope/ducktel/internal/writer"
@@ -271,6 +274,76 @@ func TestMemoryLimitAppliedWhenCgroupLimited(t *testing.T) {
 	want := "2.7 GiB"
 	if got != want {
 		t.Errorf("memory_limit = %s, want %s", got, want)
+	}
+}
+
+// TestCorruptParquetFailsLoudly pins the fallback semantics: the empty-view
+// placeholder is only for a glob that matches nothing. A view that fails to
+// build while files DO exist must surface the error — the old code silently
+// swapped in the empty view, so every later query returned a well-formed
+// "no data" for data that was really there (observed live as a trace lookup
+// alternating rows:[] and rows:[span] while views were being re-derived).
+func TestCorruptParquetFailsLoudly(t *testing.T) {
+	dir := t.TempDir()
+	seed(t, dir, "svc")
+
+	// A corrupt file alongside the valid one: read_parquet cannot bind it.
+	badDir := filepath.Join(dir, "traces", "2026-01-02")
+	if err := os.MkdirAll(badDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(badDir, "bad.parquet"), []byte("not parquet at all"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	e, err := Open(dir)
+	if err == nil {
+		e.Close()
+		t.Fatal("Open with a corrupt parquet file must fail loudly, not fall back to an empty view")
+	}
+	if !strings.Contains(err.Error(), "traces view") {
+		t.Errorf("error should name the failing view, got: %v", err)
+	}
+}
+
+// TestConcurrentQueriesNeverSeeEmpty hammers reads from several goroutines
+// while an engine is in use, pinning the refresh-then-query critical section:
+// before serialisation, interleaved view re-derivations could leave a query
+// answering from a mid-replacement view (empty), which at the REST layer is
+// indistinguishable from "no data".
+func TestConcurrentQueriesNeverSeeEmpty(t *testing.T) {
+	dir := t.TempDir()
+	seed(t, dir, "svc")
+
+	e, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+
+	var wg sync.WaitGroup
+	errCh := make(chan error, 64)
+	for g := 0; g < 8; g++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < 15; i++ {
+				rows, _, err := e.Query("SELECT count(*) AS c FROM traces")
+				if err != nil {
+					errCh <- fmt.Errorf("query errored during concurrency: %w", err)
+					return
+				}
+				if rows[0]["c"].(int64) == 0 {
+					errCh <- fmt.Errorf("query returned 0 rows for seeded data — a view was observed mid-replacement")
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		t.Error(err)
 	}
 }
 

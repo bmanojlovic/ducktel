@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 
 	_ "github.com/marcboeker/go-duckdb"
 )
@@ -30,6 +31,12 @@ func validView(name string) bool {
 type Engine struct {
 	db      *sql.DB
 	dataDir string
+	// mu serializes the refresh-then-query sequence. Views are re-derived per
+	// query so files written after Open stay visible; without serialization,
+	// concurrent requests interleave CREATE OR REPLACE VIEW with queries and
+	// with each other, and one losing that race used to swap the signal view
+	// for the empty fallback — rows:[] at HTTP 200 for data that exists.
+	mu sync.Mutex
 }
 
 // cgroupMemoryFiles are the paths read to detect a container memory limit —
@@ -154,7 +161,21 @@ func (e *Engine) CreateViews() error {
 		glob := filepath.Join(e.dataDir, v.signal, "**", "*.parquet")
 		q := fmt.Sprintf(`CREATE OR REPLACE VIEW %s AS SELECT * FROM read_parquet('%s', union_by_name=true)`, v.name, glob)
 		if _, err := e.db.Exec(q); err != nil {
-			// No files yet — create empty view with correct schema
+			// A glob that matches no files justifies the empty placeholder
+			// view. Anything else must NOT be swallowed: silently replacing a
+			// working view with the empty one made every later query return a
+			// well-formed empty result for data that exists — wrong answers
+			// indistinguishable from "no data" (observed live as a trace
+			// lookup alternating rows:[] / rows:[span] while a concurrent
+			// query was re-deriving the views). Confirm the glob is really
+			// empty, then fall back or report.
+			var matched int64
+			if gerr := e.db.QueryRow(fmt.Sprintf("SELECT count(*) FROM glob('%s')", glob)).Scan(&matched); gerr != nil {
+				return fmt.Errorf("creating %s view: %w (glob check also failed: %v)", v.name, err, gerr)
+			}
+			if matched > 0 {
+				return fmt.Errorf("creating %s view from %d matched file(s): %w", v.name, matched, err)
+			}
 			empty := fmt.Sprintf(`CREATE OR REPLACE VIEW %s AS SELECT %s WHERE false`, v.name, v.emptyCols)
 			if _, err2 := e.db.Exec(empty); err2 != nil {
 				return fmt.Errorf("creating empty %s view: %w", v.name, err2)
@@ -168,6 +189,13 @@ func (e *Engine) CreateViews() error {
 // sent to DuckDB as placeholders (?) rather than interpolated into the SQL
 // string, which prevents SQL injection from caller-supplied values.
 func (e *Engine) Query(sqlStr string, args ...interface{}) ([]map[string]interface{}, []string, error) {
+	// The refresh and the query are one critical section: two requests
+	// interleaving their CREATE OR REPLACE VIEW statements used to leave one
+	// of them querying a view mid-replacement, and its lost race surfaced as
+	// silent empty results. See the mu field.
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
 	// Re-derive the views so the query sees Parquet files written since the
 	// engine was opened. Cheap: DuckDB resolves the glob at view creation.
 	if err := e.CreateViews(); err != nil {
@@ -221,6 +249,8 @@ func (e *Engine) Describe(view string) ([]ColumnInfo, error) {
 	if !validView(view) {
 		return nil, fmt.Errorf("unknown view %q (expected traces, logs, or metrics)", view)
 	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
 	if err := e.CreateViews(); err != nil {
 		return nil, fmt.Errorf("refreshing views: %w", err)
 	}
