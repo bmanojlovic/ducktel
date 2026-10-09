@@ -159,11 +159,12 @@ func (s *Server) spanSearch(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 
 type logSearchArgs struct {
 	Tenant       string       `json:"tenant" jsonschema:"the tenant to query; only data for this tenant is returned"`
+	TraceID      string       `json:"trace_id,omitempty" jsonschema:"restrict to the records of one trace id. A trace id is a precise key, so this searches the whole history unless since_minutes is given."`
 	ServiceName  string       `json:"service_name,omitempty" jsonschema:"restrict to one service name"`
 	Severity     string       `json:"severity,omitempty" jsonschema:"exact severity to match, case-insensitive: DEBUG, INFO, WARN, ERROR, FATAL. Matches the severity text senders set."`
 	Search       string       `json:"search,omitempty" jsonschema:"case-insensitive substring to find in the log body"`
 	Filters      []attrFilter `json:"filters,omitempty" jsonschema:"attribute key/value pairs to match (ANDed together), against record attributes OR resource attributes. Omit to match all records in the time range."`
-	SinceMinutes int          `json:"since_minutes,omitempty" jsonschema:"how far back to search, in minutes. Default 60."`
+	SinceMinutes int          `json:"since_minutes,omitempty" jsonschema:"how far back to search, in minutes. Default 60 (whole history when trace_id is given)."`
 	Limit        int          `json:"limit,omitempty" jsonschema:"maximum log records to return, default 100. Cap 1000."`
 }
 
@@ -173,7 +174,7 @@ func (s *Server) logSearch(ctx context.Context, req *sdkmcp.CallToolRequest, arg
 		filters[i] = telemetry.AttrFilter{Key: f.Key, Value: f.Value}
 	}
 
-	rows, cols, err := s.core.SearchLogs(args.Tenant, args.ServiceName, args.Severity, args.Search, filters, args.SinceMinutes, args.Limit)
+	rows, cols, err := s.core.SearchLogs(args.Tenant, args.TraceID, args.ServiceName, args.Severity, args.Search, filters, args.SinceMinutes, args.Limit)
 	if err != nil {
 		return errResult(err.Error())
 	}

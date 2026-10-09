@@ -547,9 +547,17 @@ func TestMetricQueryAttrGroupByAndFilterCombined(t *testing.T) {
 
 // --- log search ---
 
+// withTrace tags a seeded record with a trace id.
+func withTrace(r writer.LogRecord, traceID string) writer.LogRecord {
+	r.TraceID = traceID
+	return r
+}
+
 // newLogCore seeds log records covering the filter dimensions: two tenants,
 // two services, three severities, distinguishable bodies, a record-level and
-// a resource-level attribute, and one record older than the default window.
+// a resource-level attribute, one record older than the default window, and
+// trace ids (trace-1 with two records, trace-2, a globex trace, and a 48h-old
+// trace).
 func newLogCore(t *testing.T) *Core {
 	t.Helper()
 	dir := t.TempDir()
@@ -566,11 +574,11 @@ func newLogCore(t *testing.T) *Core {
 	}
 	now := time.Now()
 	w.AddLogs([]writer.LogRecord{
-		logRec("api", "acme", "ERROR", "connection refused to payments-db", `{"http.status_code":"500"}`, now.Add(-2*time.Minute)),
-		logRec("api", "acme", "INFO", "handled GET /products in 12ms", `{}`, now.Add(-3*time.Minute)),
-		logRec("worker", "acme", "WARN", "queue depth above threshold", `{"queue":"sync"}`, now.Add(-4*time.Minute)),
-		logRec("api", "globex", "ERROR", "globex-only failure", `{}`, now.Add(-1*time.Minute)),
-		logRec("nightly", "acme", "ERROR", "ancient failure", `{}`, now.Add(-48*time.Hour)),
+		withTrace(logRec("api", "acme", "ERROR", "connection refused to payments-db", `{"http.status_code":"500"}`, now.Add(-2*time.Minute)), "trace-1"),
+		withTrace(logRec("api", "acme", "INFO", "handled GET /products in 12ms", `{}`, now.Add(-3*time.Minute)), "trace-1"),
+		withTrace(logRec("worker", "acme", "WARN", "queue depth above threshold", `{"queue":"sync"}`, now.Add(-4*time.Minute)), "trace-2"),
+		withTrace(logRec("api", "globex", "ERROR", "globex-only failure", `{}`, now.Add(-1*time.Minute)), "trace-globex-1"),
+		withTrace(logRec("nightly", "acme", "ERROR", "ancient failure", `{}`, now.Add(-48*time.Hour)), "trace-old"),
 	})
 	if err := w.Flush(); err != nil {
 		t.Fatalf("seeding: %v", err)
@@ -588,14 +596,14 @@ func TestSearchLogsTenantIsolation(t *testing.T) {
 	c := newLogCore(t)
 
 	// acme sees its 3 in-window records; globex's and the 48h-old one stay out.
-	rows, _, err := c.SearchLogs("acme", "", "", "", nil, 0, 0)
+	rows, _, err := c.SearchLogs("acme", "", "", "", "", nil, 0, 0)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if n := len(rows); n != 3 {
 		t.Errorf("acme logs = %d rows, want 3 (globex or old leaked?)", n)
 	}
-	rows, _, _ = c.SearchLogs("globex", "", "", "", nil, 0, 0)
+	rows, _, _ = c.SearchLogs("globex", "", "", "", "", nil, 0, 0)
 	if n := len(rows); n != 1 {
 		t.Errorf("globex logs = %d rows, want 1", n)
 	}
@@ -604,7 +612,7 @@ func TestSearchLogsTenantIsolation(t *testing.T) {
 func TestSearchLogsNewestFirst(t *testing.T) {
 	c := newLogCore(t)
 
-	rows, _, err := c.SearchLogs("acme", "", "", "", nil, 0, 0)
+	rows, _, err := c.SearchLogs("acme", "", "", "", "", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -617,7 +625,7 @@ func TestSearchLogsSeverityCaseInsensitive(t *testing.T) {
 	c := newLogCore(t)
 
 	for _, sev := range []string{"error", "ERROR", "Error"} {
-		rows, _, err := c.SearchLogs("acme", "", sev, "", nil, 0, 0)
+		rows, _, err := c.SearchLogs("acme", "", "", sev, "", nil, 0, 0)
 		if err != nil {
 			t.Fatalf("severity %q: %v", sev, err)
 		}
@@ -631,7 +639,7 @@ func TestSearchLogsBodySearchCaseInsensitive(t *testing.T) {
 	c := newLogCore(t)
 
 	for _, q := range []string{"refused", "REFUSED", "connection"} {
-		rows, _, err := c.SearchLogs("acme", "", "", q, nil, 0, 0)
+		rows, _, err := c.SearchLogs("acme", "", "", "", q, nil, 0, 0)
 		if err != nil {
 			t.Fatalf("search %q: %v", q, err)
 		}
@@ -644,7 +652,7 @@ func TestSearchLogsBodySearchCaseInsensitive(t *testing.T) {
 func TestSearchLogsServiceAndCombinedFilters(t *testing.T) {
 	c := newLogCore(t)
 
-	rows, _, err := c.SearchLogs("acme", "worker", "", "", nil, 0, 0)
+	rows, _, err := c.SearchLogs("acme", "", "worker", "", "", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -653,7 +661,7 @@ func TestSearchLogsServiceAndCombinedFilters(t *testing.T) {
 	}
 
 	// severity AND service together: the api ERROR, not the worker WARN.
-	rows, _, _ = c.SearchLogs("acme", "api", "ERROR", "", nil, 0, 0)
+	rows, _, _ = c.SearchLogs("acme", "", "api", "ERROR", "", nil, 0, 0)
 	if n := len(rows); n != 1 {
 		t.Errorf("api+ERROR matched %d rows, want 1", n)
 	}
@@ -666,7 +674,7 @@ func TestSearchLogsAttributeFilters(t *testing.T) {
 	c := newLogCore(t)
 
 	// Record-level attribute.
-	rows, _, err := c.SearchLogs("acme", "", "", "", []AttrFilter{{Key: "http.status_code", Value: "500"}}, 0, 0)
+	rows, _, err := c.SearchLogs("acme", "", "", "", "", []AttrFilter{{Key: "http.status_code", Value: "500"}}, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -675,19 +683,19 @@ func TestSearchLogsAttributeFilters(t *testing.T) {
 	}
 
 	// Resource-level attribute through the same filter (dual scope).
-	rows, _, _ = c.SearchLogs("acme", "", "", "", []AttrFilter{{Key: "service.name", Value: "worker"}}, 0, 0)
+	rows, _, _ = c.SearchLogs("acme", "", "", "", "", []AttrFilter{{Key: "service.name", Value: "worker"}}, 0, 0)
 	if n := len(rows); n != 1 {
 		t.Errorf("resource-attr filter matched %d rows, want 1", n)
 	}
 
 	// Injection-shaped value stays data.
-	rows, _, _ = c.SearchLogs("acme", "", "", "", []AttrFilter{{Key: "http.status_code", Value: "500' OR '1'='1"}}, 0, 0)
+	rows, _, _ = c.SearchLogs("acme", "", "", "", "", []AttrFilter{{Key: "http.status_code", Value: "500' OR '1'='1"}}, 0, 0)
 	if n := len(rows); n != 0 {
 		t.Errorf("injection filter matched %d rows, want 0", n)
 	}
 
 	// Empty key is rejected.
-	_, _, err = c.SearchLogs("acme", "", "", "", []AttrFilter{{Key: "", Value: "x"}}, 0, 0)
+	_, _, err = c.SearchLogs("acme", "", "", "", "", []AttrFilter{{Key: "", Value: "x"}}, 0, 0)
 	if err == nil {
 		t.Error("empty filter key should error")
 	}
@@ -696,11 +704,11 @@ func TestSearchLogsAttributeFilters(t *testing.T) {
 func TestSearchLogsWiderWindowIncludesOld(t *testing.T) {
 	c := newLogCore(t)
 
-	rows, _, _ := c.SearchLogs("acme", "", "", "ancient", nil, 0, 0)
+	rows, _, _ := c.SearchLogs("acme", "", "", "", "ancient", nil, 0, 0)
 	if n := len(rows); n != 0 {
 		t.Errorf("48h-old log leaked into the default window: %d rows", n)
 	}
-	rows, _, err := c.SearchLogs("acme", "", "", "ancient", nil, 7*24*60, 0)
+	rows, _, err := c.SearchLogs("acme", "", "", "", "ancient", nil, 7*24*60, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -712,7 +720,7 @@ func TestSearchLogsWiderWindowIncludesOld(t *testing.T) {
 func TestSearchLogsLimitIsCapped(t *testing.T) {
 	c := newLogCore(t)
 
-	rows, _, err := c.SearchLogs("acme", "", "", "", nil, 0, 100000)
+	rows, _, err := c.SearchLogs("acme", "", "", "", "", nil, 0, 100000)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -724,8 +732,56 @@ func TestSearchLogsLimitIsCapped(t *testing.T) {
 func TestSearchLogsRequiresTenant(t *testing.T) {
 	c := newLogCore(t)
 
-	if _, _, err := c.SearchLogs("", "", "", "", nil, 0, 0); err == nil {
+	if _, _, err := c.SearchLogs("", "", "", "", "", nil, 0, 0); err == nil {
 		t.Error("missing tenant should error")
+	}
+}
+
+// --- trace-scoped log lookup ---
+
+func TestSearchLogsByTraceID(t *testing.T) {
+	c := newLogCore(t)
+
+	rows, _, err := c.SearchLogs("acme", "trace-1", "", "", "", nil, 0, 0)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if n := len(rows); n != 2 {
+		t.Errorf("trace-1 has %d records, want 2", n)
+	}
+
+	// Combined with another filter.
+	rows, _, _ = c.SearchLogs("acme", "trace-1", "", "ERROR", "", nil, 0, 0)
+	if n := len(rows); n != 1 {
+		t.Errorf("trace-1 + ERROR = %d records, want 1", n)
+	}
+
+	// Tenant isolation holds through the trace path: globex's trace must not
+	// be readable as acme's.
+	rows, _, _ = c.SearchLogs("acme", "trace-globex-1", "", "", "", nil, 0, 0)
+	if n := len(rows); n != 0 {
+		t.Errorf("acme read globex's trace logs: %d records", n)
+	}
+}
+
+// TestSearchLogsTraceIDHasNoDefaultWindow pins the semantic that makes the
+// waterfall work for old traces: a trace id is a precise key, so it looks
+// across the whole history unless a window is given explicitly.
+func TestSearchLogsTraceIDHasNoDefaultWindow(t *testing.T) {
+	c := newLogCore(t)
+
+	rows, _, err := c.SearchLogs("acme", "trace-old", "", "", "", nil, 0, 0)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if n := len(rows); n != 1 {
+		t.Errorf("48h-old trace returned %d records, want 1 (default window must not apply to a trace lookup)", n)
+	}
+
+	// An explicit window still bounds it.
+	rows, _, _ = c.SearchLogs("acme", "trace-old", "", "", "", nil, 60, 0)
+	if n := len(rows); n != 0 {
+		t.Errorf("explicit 60m window returned %d records, want 0", n)
 	}
 }
 

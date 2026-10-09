@@ -44,15 +44,16 @@ func newTestMux(t *testing.T, token string) *http.ServeMux {
 	})
 	w.AddLogs([]writer.LogRecord{
 		{Timestamp: time.Now().UnixMicro(), ServiceName: "api", SeverityText: "ERROR",
-			Body: "connection refused", Attributes: "{}",
+			Body: "connection refused", Attributes: "{}", TraceID: "trace-acme-1",
 			ResourceAttributes: `{"service.name":"api","tenant.id":"acme"}`},
 		// A logs-only service: absent from traces, so it distinguishes the
-		// logs-sourced services list from the traces-sourced one.
+		// logs-sourced services list from the traces-sourced one. No trace id
+		// either — the record-outside-a-span case.
 		{Timestamp: time.Now().UnixMicro(), ServiceName: "logsonly", SeverityText: "INFO",
 			Body: "handled request", Attributes: "{}",
 			ResourceAttributes: `{"service.name":"logsonly","tenant.id":"acme"}`},
 		{Timestamp: time.Now().UnixMicro(), ServiceName: "api", SeverityText: "ERROR",
-			Body: "globex-only failure", Attributes: "{}",
+			Body: "globex-only failure", Attributes: "{}", TraceID: "trace-globex-1",
 			ResourceAttributes: `{"service.name":"api","tenant.id":"globex"}`},
 	})
 	if err := w.Flush(); err != nil {
@@ -211,6 +212,32 @@ func TestSearchLogsEndpointMissingTenantIs400(t *testing.T) {
 	rec := doReq(t, mux, "GET", "/api/logs", "")
 	if rec.Code != http.StatusBadRequest {
 		t.Errorf("status = %d, want 400: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestSearchLogsEndpointByTraceID covers the waterfall's query: all records
+// of one trace, not windowed by the default 60 minutes.
+func TestSearchLogsEndpointByTraceID(t *testing.T) {
+	mux := newTestMux(t, "")
+
+	rec := doReq(t, mux, "GET", "/api/logs?tenant=acme&trace_id=trace-acme-1", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d: %s", rec.Code, rec.Body.String())
+	}
+	var resp rowsResponse
+	json.Unmarshal(rec.Body.Bytes(), &resp)
+	if len(resp.Rows) != 1 {
+		t.Fatalf("trace-acme-1 returned %d records, want 1", len(resp.Rows))
+	}
+	if resp.Rows[0]["trace_id"] != "trace-acme-1" {
+		t.Errorf("row has trace %v", resp.Rows[0]["trace_id"])
+	}
+
+	// globex's trace must not resolve under acme.
+	rec = doReq(t, mux, "GET", "/api/logs?tenant=acme&trace_id=trace-globex-1", "")
+	json.Unmarshal(rec.Body.Bytes(), &resp)
+	if len(resp.Rows) != 0 {
+		t.Errorf("acme read globex's trace logs: %d rows", len(resp.Rows))
 	}
 }
 

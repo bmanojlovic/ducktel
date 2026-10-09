@@ -135,7 +135,7 @@ func (h *Handlers) handleSearchLogs(w http.ResponseWriter, r *http.Request) {
 	}
 
 	rows, cols, err := h.core.SearchLogs(
-		q.Get("tenant"), q.Get("service_name"), q.Get("severity"), q.Get("search"), filters,
+		q.Get("tenant"), q.Get("trace_id"), q.Get("service_name"), q.Get("severity"), q.Get("search"), filters,
 		queryInt(r, "since_minutes", 0), queryInt(r, "limit", 0),
 	)
 	if err != nil {

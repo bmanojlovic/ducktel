@@ -333,13 +333,26 @@ async function runTraceSearch() {
 }
 
 async function loadWaterfall(traceId) {
+  const tenant = encodeURIComponent(state.tenant);
+
+  // Spans and the trace's log records are independent; fetch both up front.
+  // The log fetch is best-effort: a waterfall without its logs is still
+  // useful, so a failure there must not kill the whole view.
+  const spansP = api("/api/traces/" + encodeURIComponent(traceId) + "?tenant=" + tenant);
+  const logsP = api("/api/logs?tenant=" + tenant + "&trace_id=" + encodeURIComponent(traceId) + "&limit=1000")
+    .then((r) => r.rows)
+    .catch(() => []);
+
   let resp;
   try {
-    resp = await api("/api/traces/" + encodeURIComponent(traceId) + "?tenant=" + encodeURIComponent(state.tenant));
+    resp = await spansP;
   } catch (e) {
     toast(e.message, true);
+    logsP.catch(() => {});
     return;
   }
+  const logs = await logsP;
+
   // Record trace_id in the hash so this exact waterfall is itself a
   // permalink, not just the search that found it.
   const { params: hashParams } = parseHash();
@@ -352,6 +365,21 @@ async function loadWaterfall(traceId) {
   if (spans.length === 0) {
     wf.innerHTML = `<div class="empty">no spans</div>`;
     return;
+  }
+
+  // Attach each log record to its span via span_id; records whose span_id
+  // matches no span (or is empty) are shown in a trace-level block instead
+  // of being dropped.
+  const spanIDs = new Set(spans.map((s) => s.span_id));
+  const logsBySpan = new Map();
+  const traceLevel = [];
+  for (const l of logs) {
+    if (l.span_id && spanIDs.has(l.span_id)) {
+      if (!logsBySpan.has(l.span_id)) logsBySpan.set(l.span_id, []);
+      logsBySpan.get(l.span_id).push(l);
+    } else {
+      traceLevel.push(l);
+    }
   }
 
   const minStart = Math.min(...spans.map((s) => s.start_time));
@@ -375,6 +403,10 @@ async function loadWaterfall(traceId) {
     const left = ((s.start_time - minStart) / total) * 100;
     const width = Math.max(((s.end_time - s.start_time) / total) * 100, 0.3);
     const depth = depthOf(s);
+    const spanLogs = logsBySpan.get(s.span_id) || [];
+    const logBlock = spanLogs.length
+      ? `<div class="wf-logs" style="padding-left:${depth * 14 + 14}px">${spanLogs.map(logLineMarkup).join("")}</div>`
+      : "";
     return `
       <div class="wf-row">
         <div class="wf-label" style="padding-left:${depth * 14}px" title="${escapeHtml(s.service_name)} — ${escapeHtml(s.span_name)}">
@@ -384,9 +416,19 @@ async function loadWaterfall(traceId) {
           <div class="wf-bar ${statusClass(s.status_code)}" style="left:${left}%;width:${width}%"></div>
         </div>
         <div class="wf-duration">${(s.duration_ms || 0).toFixed(1)} ms</div>
-      </div>`;
+      </div>` + logBlock;
   });
-  wf.innerHTML = `<h3>Waterfall — ${escapeHtml(traceId)}</h3>` + rows.join("");
+
+  let traceLevelBlock = "";
+  if (traceLevel.length) {
+    traceLevelBlock = `<h4 class="wf-log-heading">records not attached to a span</h4>
+      <div class="wf-logs">${traceLevel.map(logLineMarkup).join("")}</div>`;
+  }
+
+  const logCount = logs.length
+    ? ` — ${logs.length} log record${logs.length === 1 ? "" : "s"}`
+    : "";
+  wf.innerHTML = `<h3>Waterfall — ${escapeHtml(traceId)}${logCount}</h3>` + rows.join("") + traceLevelBlock;
 }
 
 // --- logs view ---
@@ -397,6 +439,26 @@ function severityClass(sev) {
   if (s === "WARN") return "sev-warn";
   if (s === "DEBUG" || s === "TRACE") return "sev-dim";
   return "";
+}
+
+// traceCell renders the logs table's trace column: a truncated id (the row
+// navigates to the waterfall) or an explicit muted marker. Records logged
+// outside any span legitimately carry no trace id, and an empty cell reads
+// as "something is broken" rather than "this record was never part of a
+// trace".
+function traceCell(traceId) {
+  if (!traceId) return `<span class="no-trace">no trace</span>`;
+  return `<span class="mono">${escapeHtml(traceId.slice(0, 12))}…</span>`;
+}
+
+// logLineMarkup renders one compact log record, used under a waterfall span
+// (attached by span_id) and in the trace-level block.
+function logLineMarkup(r) {
+  return `<div class="wf-log">
+    <span class="wf-log-sev ${severityClass(r.severity_text)}">${escapeHtml(r.severity_text || "")}</span>
+    <span class="log-body" title="${escapeHtml(r.body || "")}">${escapeHtml(r.body || "")}</span>
+    <span class="wf-log-time">${fmtTime(r.timestamp)}</span>
+  </div>`;
 }
 
 // viewTrace jumps from a log row to its trace's waterfall: switches to the
@@ -453,7 +515,7 @@ async function runLogSearch() {
       <td>${escapeHtml(r.service_name || "")}</td>
       <td class="${severityClass(r.severity_text)}">${escapeHtml(r.severity_text || "")}</td>
       <td class="log-body" title="${escapeHtml(r.body || "")}">${escapeHtml(r.body || "")}</td>
-      <td class="mono">${traceId ? escapeHtml(traceId.slice(0, 12)) + "…" : ""}</td>`;
+      <td>${traceCell(traceId)}</td>`;
     if (traceId) {
       tr.classList.add("clickable");
       tr.addEventListener("click", () => viewTrace(traceId));

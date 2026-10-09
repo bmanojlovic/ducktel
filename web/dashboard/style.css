@@ -164,6 +164,32 @@ select, input[type=text], input[type=number], input[type=password] {
 }
 tr.clickable td:last-child { text-decoration: underline; }
 
+/* explicit marker for records that never belonged to a trace — an empty
+   cell reads as broken rather than as "not part of a trace" */
+.no-trace { color: var(--muted); font-style: italic; }
+
+/* log records shown under a waterfall span, and the trailing block for
+   records not attached to any span */
+.wf-logs {
+  border-left: 2px solid var(--border);
+  margin: 2px 0 6px 0;
+}
+.wf-log {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  padding: 1px 0 1px 8px;
+  font-size: 12px;
+}
+.wf-log-sev { width: 48px; flex: none; font-weight: 600; }
+.wf-log-time { margin-left: auto; flex: none; color: var(--muted); }
+.wf-log-heading {
+  margin: 14px 0 4px 0;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--muted);
+}
+
 /* --- waterfall --- */
 
 .waterfall {

@@ -164,14 +164,19 @@ func (c *Core) SearchSpans(tenant, serviceName string, filters []AttrFilter, sin
 	return c.engine.Query(q, params...)
 }
 
-// SearchLogs finds log records matching filters within a time range, scoped
-// to tenant — the log-signal counterpart of SearchSpans, with the same
-// filter semantics: an exact service name, a case-insensitive exact severity
-// (matched against severity_text, which senders set alongside
-// severity_number), a case-insensitive body substring, and attribute filters
-// matched against record attributes OR resource attributes. Results are
-// newest first.
-func (c *Core) SearchLogs(tenant, serviceName, severity, search string, filters []AttrFilter, sinceMinutes, limit int) ([]map[string]any, []string, error) {
+// SearchLogs finds log records matching filters, scoped to tenant — the
+// log-signal counterpart of SearchSpans, with the same filter semantics: an
+// exact service name, a case-insensitive exact severity (matched against
+// severity_text, which senders set alongside severity_number), a
+// case-insensitive body substring, and attribute filters matched against
+// record attributes OR resource attributes. Results are newest first.
+//
+// traceID, when non-empty, restricts to records carrying that trace id. A
+// trace id is a precise key, so — symmetric with LookupTrace — it defaults
+// to the whole history rather than the 60-minute window; pass an explicit
+// sinceMinutes to bound it anyway. This is what lets a trace's logs be
+// found however old the trace is.
+func (c *Core) SearchLogs(tenant, traceID, serviceName, severity, search string, filters []AttrFilter, sinceMinutes, limit int) ([]map[string]any, []string, error) {
 	if err := validateTenant(tenant); err != nil {
 		return nil, nil, err
 	}
@@ -182,15 +187,25 @@ func (c *Core) SearchLogs(tenant, serviceName, severity, search string, filters 
 	if limit > 1000 {
 		limit = 1000
 	}
+
+	conds := []string{c.tenantPredicate()}
+	params := []any{tenant}
+
+	// Time window: default 60 minutes, except for a trace-scoped lookup with
+	// no explicit window — see the doc comment.
 	since := sinceMinutes
-	if since <= 0 {
+	if since <= 0 && traceID == "" {
 		since = 60
 	}
-	cutoff := time.Now().Add(-time.Duration(since) * time.Minute).UnixMicro()
+	if since > 0 {
+		conds = append(conds, "timestamp >= ?")
+		params = append(params, time.Now().Add(-time.Duration(since)*time.Minute).UnixMicro())
+	}
 
-	conds := []string{"timestamp >= ?", c.tenantPredicate()}
-	params := []any{cutoff, tenant}
-
+	if traceID != "" {
+		conds = append(conds, "trace_id = ?")
+		params = append(params, traceID)
+	}
 	if serviceName != "" {
 		conds = append(conds, "service_name = ?")
 		params = append(params, serviceName)
