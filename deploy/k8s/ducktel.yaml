@@ -57,16 +57,12 @@ spec:
             - /data
             - --flush-interval
             - 30s
-            # Retention: deletes date-partition directories older than 7
-            # days, on startup and hourly. Enabled 2026-10-09 as incident
-            # response: unbounded Parquet growth (a file per flush, no
-            # compaction) made any metrics query scan tens of thousands of
-            # files and OOM the 2Gi mcp container (exit 137, twice in one
-            # evening). A week keeps several nights of telemetry.
-            # Adjust the window deliberately, not casually — queries over
-            # the retained range are what cost memory.
-            - --retention
-            - 7d
+            # No --retention: disk growth is currently left unbounded on
+            # purpose. The OOM incident that motivated retention is fixed by
+            # compaction (past days merge into one file each, at startup and
+            # hourly) plus the engine's memory cap, so retention now only
+            # bounds disk use — deferred until it becomes the binding
+            # constraint. Add --retention <window> here when it does.
           ports:
             - name: otlp-http
               containerPort: 4318
@@ -173,11 +169,11 @@ spec:
               memory: 64Mi
             limits:
               # Querying opens DuckDB over the parquet files; bound it so a
-              # large aggregation cannot take the node down. Bumped from 1Gi
-              # after an observed OOMKill (exit 137) during normal use — the
-              # real fix is retention (bounds how much a scan can touch at
-              # all), not just a bigger ceiling, but this buys headroom now.
-              memory: 2Gi
+              # large aggregation cannot take the node down. 4Gi matches the
+              # deployed value (raised from 1Gi after observed OOMKills); the
+              # engine additionally caps DuckDB below this cgroup limit so a
+              # wide scan spills instead of dying.
+              memory: 4Gi
           volumeMounts:
             # Read-only: the MCP container never writes, which also makes it
             # impossible for a query path to corrupt stored telemetry.
