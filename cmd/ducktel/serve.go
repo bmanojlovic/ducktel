@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"os"
 	"os/signal"
@@ -19,6 +20,7 @@ func serveCmd() *cobra.Command {
 		host          string
 		port          int
 		flushInterval time.Duration
+		bufferSize    int
 		token         string
 		flushToken    string
 		retention     string
@@ -40,11 +42,20 @@ token would cross an untrusted network.
 --retention deletes whole date-partition directories older than the given
 window (accepts Go durations like 720h, or a bare day count like 30d). Empty
 (the default) disables it, so upgrading an existing deployment never starts
-deleting data without an explicit opt-in.`,
+deleting data without an explicit opt-in.
+
+--buffer-size is how many records of a signal may accumulate before a flush
+is forced ahead of the --flush-interval timer; the smaller of the two wins.
+Defaults to 1000, which keeps ingest→queryable latency low on a busy
+instance; raise it to batch more per file at the cost of a longer worst-case
+delay.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			retentionDur, err := writer.ParseRetention(retention)
 			if err != nil {
 				return err
+			}
+			if bufferSize <= 0 {
+				return fmt.Errorf("--buffer-size must be greater than zero, got %d", bufferSize)
 			}
 
 			// Env wins only when the flag was not given, so an explicit flag
@@ -71,7 +82,7 @@ deleting data without an explicit opt-in.`,
 				}
 			}
 
-			w := writer.New(dataDir, flushInterval, 1000)
+			w := writer.New(dataDir, flushInterval, bufferSize)
 			w.OnError(func(err error) {
 				log.Printf("writer error: %v", err)
 			})
@@ -90,8 +101,8 @@ deleting data without an explicit opt-in.`,
 			if retentionDur > 0 {
 				retentionState = retentionDur.String()
 			}
-			log.Printf("starting: data-dir=%s flush-interval=%s auth=%s retention=%s",
-				dataDir, flushInterval, authState, retentionState)
+			log.Printf("starting: data-dir=%s flush-interval=%s buffer-size=%d auth=%s retention=%s",
+				dataDir, flushInterval, bufferSize, authState, retentionState)
 
 			r := receiver.New(host, port, w, token, flushToken, w.Flush)
 
@@ -146,6 +157,7 @@ deleting data without an explicit opt-in.`,
 	cmd.Flags().StringVar(&token, "auth-token", "", "Require this bearer token on OTLP endpoints (env: DUCKTEL_AUTH_TOKEN)")
 	cmd.Flags().StringVar(&flushToken, "flush-token", "", "Require this bearer token on POST /flush (env: DUCKTEL_FLUSH_TOKEN, or DUCKTEL_MCP_TOKEN)")
 	cmd.Flags().StringVar(&retention, "retention", "", "Delete date-partition directories older than this (e.g. 30d, 720h); empty disables retention (default: keep forever)")
+	cmd.Flags().IntVar(&bufferSize, "buffer-size", 1000, "Records per signal buffered before a flush is forced ahead of the --flush-interval timer")
 
 	return cmd
 }

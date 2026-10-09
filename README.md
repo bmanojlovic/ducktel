@@ -174,7 +174,7 @@ ducktel saved delete "payment-errors"
 Start the OTLP receiver.
 
 ```bash
-ducktel serve [--host localhost] [--port 4318] [--flush-interval 30s] [--data-dir ./data]
+ducktel serve [--host localhost] [--port 4318] [--flush-interval 30s] [--buffer-size 1000] [--data-dir ./data]
 ducktel serve --host 0.0.0.0 --auth-token "$DUCKTEL_AUTH_TOKEN"   # network-exposed, authenticated
 ducktel serve --retention 30d                                     # delete date-partitions older than 30 days
 ```

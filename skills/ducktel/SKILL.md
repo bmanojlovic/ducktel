@@ -232,8 +232,9 @@ buffer is invisible to every tool. Ingest → queryable latency is therefore up 
 flush interval. Three triggers:
 
 1. the `--flush-interval` timer (default 30s)
-2. the in-memory buffer reaching 1000 records — hardcoded in `serve`, so a busy
-   instance flushes more often than the interval suggests
+2. the in-memory buffer reaching `--buffer-size` records (default 1000) — a busy
+   instance flushes more often than the interval suggests; raise the flag to
+   batch more per file
 3. an explicit request: the `flush_buffer` tool in HTTP mode, which calls the
    writer's `POST /flush`
 
