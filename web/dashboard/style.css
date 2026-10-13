@@ -190,14 +190,63 @@ tr.clickable td:last-child { text-decoration: underline; }
   color: var(--muted);
 }
 
+/* --- traces split pane ---
+   A trace click must land on-screen even when the result table is long, so
+   the tab fits the viewport and its two panes scroll independently: the
+   table above (sticky header), the waterfall pinned to the lower region.
+   app.js sizes the tab from its own offset to the viewport bottom, so there
+   are no magic header/filter heights to keep in sync. */
+
+.tab-split { display: flex; flex-direction: column; }
+
+.split {
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+/* The scroll container carries the card look; the table inside drops both so
+   the sticky header anchors to this pane — `overflow: hidden` on the table
+   would make the table itself the sticky context and freeze the header. */
+.split-top {
+  flex: 1 1 auto;
+  min-height: 120px;
+  overflow-y: auto;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+.split-top .data-table {
+  border: none;
+  border-radius: 0;
+  overflow: visible;
+  background: transparent;
+}
+.split-top .data-table thead th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  background: var(--panel);
+}
+
 /* --- waterfall --- */
 
 .waterfall {
-  margin-top: 16px;
+  margin-top: 10px;
   background: var(--panel);
   border: 1px solid var(--border);
   border-radius: 6px;
   padding: 12px;
+}
+
+/* Inside the traces split it is the fixed lower pane, not a card in the
+   page flow. */
+.tab-split .split .waterfall {
+  flex: 0 0 45%;
+  min-height: 150px;
+  overflow-y: auto;
+  margin-top: 10px;
 }
 .wf-row {
   display: flex;

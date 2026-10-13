@@ -35,7 +35,7 @@
     <span id="toast" class="toast"></span>
   </header>
 
-  <section id="tab-traces" class="tab">
+  <section id="tab-traces" class="tab tab-split">
     <form id="traces-form" class="filters">
       <label>Service <select id="f-service"><option value="">any</option></select></label>
       <label>Since (min) <input id="f-since" type="number" value="60" min="1"></label>
@@ -45,12 +45,16 @@
       <button type="submit">Search</button>
     </form>
 
-    <table id="traces-table" class="data-table">
-      <thead><tr><th>Start</th><th>Service</th><th>Span</th><th>Duration</th><th>Status</th><th>Trace</th></tr></thead>
-      <tbody></tbody>
-    </table>
+    <div class="split">
+      <div class="split-top">
+        <table id="traces-table" class="data-table">
+          <thead><tr><th>Start</th><th>Service</th><th>Span</th><th>Duration</th><th>Status</th><th>Trace</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
 
-    <div id="waterfall" class="waterfall hidden"></div>
+      <div id="waterfall" class="waterfall hidden"></div>
+    </div>
   </section>
 
   <section id="tab-logs" class="tab hidden">

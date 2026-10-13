@@ -242,6 +242,20 @@ async function loadConfig() {
 function activateTab(name) {
   document.querySelectorAll(".tab-btn").forEach((b) => b.classList.toggle("active", b.dataset.tab === name));
   document.querySelectorAll(".tab").forEach((sec) => sec.classList.toggle("hidden", sec.id !== "tab-" + name));
+  if (name === "traces") fitTracesSplit();
+}
+
+// fitTracesSplit sizes the traces tab to the remaining viewport so its two
+// panes (table, waterfall) each scroll on their own instead of the page
+// scrolling past the waterfall. The tab's own offset gives the header and
+// filter height, so nothing here has to track their sizes. The floor keeps
+// short windows on page-level scrolling rather than clipping either pane.
+function fitTracesSplit() {
+  const tab = document.getElementById("tab-traces");
+  if (tab.classList.contains("hidden")) return;
+  const top = tab.getBoundingClientRect().top;
+  const h = Math.max(window.innerHeight - top - 16, 420);
+  tab.style.height = h + "px";
 }
 
 function initTabs() {
@@ -434,6 +448,9 @@ async function loadWaterfall(traceId) {
     ? ` — ${logs.length} log record${logs.length === 1 ? "" : "s"}`
     : "";
   wf.innerHTML = `<h3>Waterfall — ${escapeHtml(traceId)}${logCount}</h3>` + rows.join("") + traceLevelBlock;
+  // The pane keeps its own scroll across loads; a freshly selected trace
+  // should always start at its top.
+  wf.scrollTop = 0;
 }
 
 // --- logs view ---
@@ -794,6 +811,9 @@ function init() {
   document.getElementById("logout-btn").addEventListener("click", logout);
 
   window.addEventListener("hashchange", onHashchange);
+  // Keep the traces split sized to the window (a resized viewport changes the
+  // space both panes get).
+  window.addEventListener("resize", fitTracesSplit);
 
   // If a token is already stored (persists across tabs/restarts now — see
   // the top-of-file note on localStorage), skip the gate.
