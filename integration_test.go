@@ -308,3 +308,102 @@ func TestMetrics(t *testing.T) {
 func ptrFloat64(f float64) *float64 {
 	return &f
 }
+
+// seedSpans writes two spans with distinct services and flushes them, giving
+// the injection tests a populated store to attack.
+func seedSpans(t *testing.T, dir string) {
+	t.Helper()
+	w := writer.New(dir, 1*time.Hour, 1000)
+	now := time.Now()
+	w.Add([]writer.TraceSpan{
+		{TraceID: "t1", SpanID: "s1", ServiceName: "svc-a", SpanName: "op",
+			StartTime: now.UnixMicro(), EndTime: now.UnixMicro(), DurationMs: 1,
+			StatusCode: "STATUS_CODE_OK", Attributes: "{}", ResourceAttributes: "{}", Events: "[]", Links: "[]"},
+		{TraceID: "t2", SpanID: "s2", ServiceName: "svc-b", SpanName: "op",
+			StartTime: now.UnixMicro(), EndTime: now.UnixMicro(), DurationMs: 2,
+			StatusCode: "STATUS_CODE_ERROR", Attributes: "{}", ResourceAttributes: "{}", Events: "[]", Links: "[]"},
+	})
+	if err := w.Flush(); err != nil {
+		t.Fatalf("seeding spans: %v", err)
+	}
+}
+
+// TestQueryBindsParameters verifies that values passed as args are treated as
+// data, not SQL. Before parameterization the filters interpolated values into
+// the statement, so an OR-payload widened the result set and a stacked DROP
+// VIEW destroyed the database.
+func TestQueryBindsParameters(t *testing.T) {
+	dir := t.TempDir()
+	seedSpans(t, dir)
+
+	engine, err := query.Open(dir)
+	if err != nil {
+		t.Fatalf("opening query engine: %v", err)
+	}
+	defer engine.Close()
+
+	// A legitimate filter still works and matches exactly one row.
+	results, _, err := engine.Query("SELECT service_name FROM traces WHERE service_name = ?", "svc-a")
+	if err != nil {
+		t.Fatalf("legit query: %v", err)
+	}
+	if len(results) != 1 {
+		t.Fatalf("legit filter returned %d rows, want 1", len(results))
+	}
+
+	// Every payload must be treated as a literal value: no rows match, and
+	// crucially no stacked statement executes.
+	payloads := []string{
+		"svc-a' OR '1'='1",
+		"' UNION SELECT name FROM sqlite_master -- ",
+		"x'; DROP VIEW traces; --",
+		"' UNION SELECT column0, column0, column0, column0, 0, 0, column0 FROM read_csv('/etc/passwd') -- ",
+	}
+	for _, p := range payloads {
+		got, _, err := engine.Query("SELECT service_name FROM traces WHERE service_name = ?", p)
+		if err != nil {
+			t.Errorf("payload %q returned error: %v", p, err)
+			continue
+		}
+		if len(got) != 0 {
+			t.Errorf("payload %q matched %d rows, want 0 — value was interpreted as SQL", p, len(got))
+		}
+	}
+
+	// The view must still be queryable after the DROP attempt.
+	results, _, err = engine.Query("SELECT count(*) AS c FROM traces")
+	if err != nil {
+		t.Fatalf("traces view was destroyed by an injected statement: %v", err)
+	}
+	if len(results) != 1 {
+		t.Fatalf("count query returned %d rows, want 1", len(results))
+	}
+}
+
+// TestDescribeRejectsUnknownView verifies the identifier allowlist, since view
+// names cannot be bound as parameters.
+func TestDescribeRejectsUnknownView(t *testing.T) {
+	dir := t.TempDir()
+	engine, err := query.Open(dir)
+	if err != nil {
+		t.Fatalf("opening query engine: %v", err)
+	}
+	defer engine.Close()
+
+	for _, v := range []string{"traces", "logs", "metrics"} {
+		if _, err := engine.Describe(v); err != nil {
+			t.Errorf("Describe(%q) returned error: %v", v, err)
+		}
+	}
+
+	for _, v := range []string{
+		"traces; DROP VIEW traces",
+		"traces WHERE 1=1",
+		"nonexistent",
+		"",
+	} {
+		if _, err := engine.Describe(v); err == nil {
+			t.Errorf("Describe(%q) succeeded, want rejection", v)
+		}
+	}
+}

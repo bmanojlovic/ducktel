@@ -34,27 +34,32 @@ func logsCmd() *cobra.Command {
 			q := "SELECT timestamp, service_name, severity_text, body, trace_id, span_id FROM logs"
 
 			var conditions []string
+			var params []interface{}
 			if service != "" {
-				conditions = append(conditions, fmt.Sprintf("service_name = '%s'", service))
+				conditions = append(conditions, "service_name = ?")
+				params = append(params, service)
 			}
 			if since > 0 {
 				cutoff := time.Now().Add(-since).UnixMicro()
-				conditions = append(conditions, fmt.Sprintf("timestamp >= %d", cutoff))
+				conditions = append(conditions, "timestamp >= ?")
+				params = append(params, cutoff)
 			}
 			if severity != "" {
-				conditions = append(conditions, fmt.Sprintf("UPPER(severity_text) = '%s'", strings.ToUpper(severity)))
+				conditions = append(conditions, "UPPER(severity_text) = ?")
+				params = append(params, strings.ToUpper(severity))
 			}
 			if search != "" {
-				conditions = append(conditions, fmt.Sprintf("body ILIKE '%%%s%%'", search))
+				conditions = append(conditions, "body ILIKE ?")
+				params = append(params, "%"+search+"%")
 			}
 
 			if len(conditions) > 0 {
 				q += " WHERE " + strings.Join(conditions, " AND ")
 			}
 			q += " ORDER BY timestamp DESC"
-			q += fmt.Sprintf(" LIMIT %d", limit)
+			q += fmt.Sprintf(" LIMIT %d", clampLimit(limit))
 
-			results, columns, err := engine.Query(q)
+			results, columns, err := engine.Query(q, params...)
 			if err != nil {
 				return fmt.Errorf("querying logs: %w", err)
 			}
