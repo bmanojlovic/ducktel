@@ -8,13 +8,15 @@ import (
 	"github.com/davidgeorgehope/ducktel/internal/writer"
 )
 
-// TestDiscoveryIgnoresDataOutsideWindow: the List* pickers only look at
-// DiscoveryWindow, so a tenant/service/metric silent for longer is not listed
-// (and its old files are not scanned).
-func TestDiscoveryIgnoresDataOutsideWindow(t *testing.T) {
+// TestDiscoveryListsWholeHistory: the pickers list every tenant, service
+// and metric ever stored, not only recent ones. A tenant that went quiet
+// months ago must still be selectable, together with its services and
+// metrics (a 7-day bound once hid every tenant but the active one, and left
+// an old tenant's lists empty).
+func TestDiscoveryListsWholeHistory(t *testing.T) {
 	dir := t.TempDir()
 	w := writer.New(dir, time.Hour, 1000)
-	old := time.Now().Add(-DiscoveryWindow - 24*time.Hour).UnixMicro()
+	old := time.Now().Add(-90 * 24 * time.Hour).UnixMicro()
 	now := time.Now().UnixMicro()
 	span := func(svc, tenant string, ts int64) writer.TraceSpan {
 		return writer.TraceSpan{
@@ -24,10 +26,9 @@ func TestDiscoveryIgnoresDataOutsideWindow(t *testing.T) {
 			Events: "[]", Links: "[]",
 		}
 	}
-	w.Add([]writer.TraceSpan{span("fresh", "acme", now), span("stale", "acme", old), span("gone", "oldco", old)})
+	w.Add([]writer.TraceSpan{span("fresh", "acme", now), span("quiet", "oldco", old)})
 	w.AddMetrics([]writer.MetricPoint{
-		{MetricName: "fresh.metric", MetricType: "gauge", Timestamp: now, ResourceAttributes: `{"tenant.id":"acme"}`},
-		{MetricName: "stale.metric", MetricType: "gauge", Timestamp: old, ResourceAttributes: `{"tenant.id":"acme"}`},
+		{MetricName: "old.metric", MetricType: "gauge", Timestamp: old, ResourceAttributes: `{"tenant.id":"oldco"}`},
 	})
 	if err := w.Flush(); err != nil {
 		t.Fatal(err)
@@ -51,22 +52,22 @@ func TestDiscoveryIgnoresDataOutsideWindow(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := values(rows, "tenant"); len(got) != 1 || got[0] != "acme" {
-		t.Errorf("tenants = %v, want [acme]", got)
+	if got := values(rows, "tenant"); len(got) != 2 || got[0] != "acme" || got[1] != "oldco" {
+		t.Errorf("tenants = %v, want [acme oldco]", got)
 	}
-	rows, _, err = c.ListServices("acme")
+	rows, _, err = c.ListServices("oldco")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := values(rows, "service_name"); len(got) != 1 || got[0] != "fresh" {
-		t.Errorf("services = %v, want [fresh]", got)
+	if got := values(rows, "service_name"); len(got) != 1 || got[0] != "quiet" {
+		t.Errorf("oldco services = %v, want [quiet]", got)
 	}
-	rows, _, err = c.ListMetricNames("acme")
+	rows, _, err = c.ListMetricNames("oldco")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := values(rows, "metric_name"); len(got) != 1 || got[0] != "fresh.metric" {
-		t.Errorf("metric names = %v, want [fresh.metric]", got)
+	if got := values(rows, "metric_name"); len(got) != 1 || got[0] != "old.metric" {
+		t.Errorf("oldco metric names = %v, want [old.metric]", got)
 	}
 }
 

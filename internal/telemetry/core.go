@@ -384,15 +384,6 @@ func (c *Core) QueryMetric(tenant, metricName, aggregation string, sinceMinutes 
 	return c.engine.Query(q, params...)
 }
 
-// DiscoveryWindow bounds the List* discovery queries to recent data. They
-// feed pickers (tenants, services, metric names), so something silent for a
-// week has nothing worth picking. Unbounded, each one scanned every stored
-// Parquet file and parsed the resource-attribute JSON of every row; four of
-// them run on every dashboard load, which OOM-killed the query process once
-// the data grew. With the bound, Parquet min/max statistics let DuckDB skip
-// older row groups without decoding them.
-const DiscoveryWindow = 7 * 24 * time.Hour
-
 // discoveryTTL is how long a List* result is reused. Every page load (and
 // every reconnect after an error) asks for the same lists; re-scanning for
 // each is pure cost, and a list that is a few minutes stale is harmless.
@@ -428,30 +419,25 @@ func (c *Core) discover(key, q string, args ...any) ([]map[string]any, []string,
 	return rows, cols, nil
 }
 
-func discoveryCutoff() int64 {
-	return time.Now().Add(-DiscoveryWindow).UnixMicro()
-}
-
-// ListTenants returns the distinct tenant ids seen in traces within
-// DiscoveryWindow. No MCP tool needs this — an agent caller already knows its
+// ListTenants returns the distinct tenant ids seen in stored traces. No MCP
+// tool needs this — an agent caller already knows its
 // own tenant — but a human-facing consumer needs a way to discover what exists.
 func (c *Core) ListTenants() ([]map[string]any, []string, error) {
 	path := strings.ReplaceAll(jsonPath(c.tenantAttr), "'", "''")
 	q := fmt.Sprintf(`SELECT DISTINCT json_extract_string(resource_attributes, '%s') AS tenant
 	      FROM traces
-	      WHERE start_time >= ? AND json_extract_string(resource_attributes, '%s') IS NOT NULL
+	      WHERE json_extract_string(resource_attributes, '%s') IS NOT NULL
 	      ORDER BY 1`, path, path)
-	return c.discover("tenants", q, discoveryCutoff())
+	return c.discover("tenants", q)
 }
 
-// ListServices returns distinct service names within one tenant, from traces
-// within DiscoveryWindow.
+// ListServices returns distinct service names within one tenant.
 func (c *Core) ListServices(tenant string) ([]map[string]any, []string, error) {
 	if err := validateTenant(tenant); err != nil {
 		return nil, nil, err
 	}
-	q := `SELECT DISTINCT service_name FROM traces WHERE start_time >= ? AND ` + c.tenantPredicate() + ` ORDER BY 1`
-	return c.discover("services\x00"+tenant, q, discoveryCutoff(), tenant)
+	q := `SELECT DISTINCT service_name FROM traces WHERE ` + c.tenantPredicate() + ` ORDER BY 1`
+	return c.discover("services\x00"+tenant, q, tenant)
 }
 
 // ListLogServices returns distinct service names within one tenant as seen
@@ -463,8 +449,8 @@ func (c *Core) ListLogServices(tenant string) ([]map[string]any, []string, error
 	if err := validateTenant(tenant); err != nil {
 		return nil, nil, err
 	}
-	q := `SELECT DISTINCT service_name FROM logs WHERE timestamp >= ? AND ` + c.tenantPredicate() + ` ORDER BY 1`
-	return c.discover("logservices\x00"+tenant, q, discoveryCutoff(), tenant)
+	q := `SELECT DISTINCT service_name FROM logs WHERE ` + c.tenantPredicate() + ` ORDER BY 1`
+	return c.discover("logservices\x00"+tenant, q, tenant)
 }
 
 // ListMetricNames returns distinct metric names within one tenant. Like
@@ -475,6 +461,6 @@ func (c *Core) ListMetricNames(tenant string) ([]map[string]any, []string, error
 	if err := validateTenant(tenant); err != nil {
 		return nil, nil, err
 	}
-	q := `SELECT DISTINCT metric_name FROM metrics WHERE timestamp >= ? AND ` + c.tenantPredicate() + ` ORDER BY 1`
-	return c.discover("metricnames\x00"+tenant, q, discoveryCutoff(), tenant)
+	q := `SELECT DISTINCT metric_name FROM metrics WHERE ` + c.tenantPredicate() + ` ORDER BY 1`
+	return c.discover("metricnames\x00"+tenant, q, tenant)
 }
