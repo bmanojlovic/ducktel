@@ -35,7 +35,7 @@ func NewHandlers(core *telemetry.Core, flusher *telemetry.Flusher, token string)
 // check as every other authenticated surface in ducktel.
 func (h *Handlers) Register(mux *http.ServeMux) {
 	auth := func(fn http.HandlerFunc) http.Handler {
-		return httpauth.Bearer(h.token, fn)
+		return logRequests(httpauth.Bearer(h.token, fn))
 	}
 	mux.Handle("GET /api/traces", auth(h.handleSearchSpans))
 	mux.Handle("GET /api/traces/{trace_id}", auth(h.handleLookupTrace))
