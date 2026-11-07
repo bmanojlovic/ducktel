@@ -534,3 +534,20 @@ func TestConfigHidesFlushWithoutScope(t *testing.T) {
 		t.Errorf("config for read-only key: %s", rec.Body.String())
 	}
 }
+
+// TestMetricsMissingParamsListsThem: a 400 that names every parameter, so a
+// REST caller does not have to read the SPA to find out what is required.
+func TestMetricsMissingParamsListsThem(t *testing.T) {
+	mux := newTestMux(t, "")
+	for _, target := range []string{"/api/metrics?tenant=acme", "/api/metrics?tenant=acme&metric_name=cpu.util"} {
+		rec := doReq(t, mux, "GET", target, "")
+		if rec.Code != http.StatusBadRequest {
+			t.Errorf("%s: status = %d, want 400", target, rec.Code)
+		}
+		for _, want := range []string{"metric_name", "aggregation", "since_minutes", "group_by", "filter=key:value", "p95"} {
+			if !strings.Contains(rec.Body.String(), want) {
+				t.Errorf("%s: body %q does not mention %s", target, rec.Body.String(), want)
+			}
+		}
+	}
+}
