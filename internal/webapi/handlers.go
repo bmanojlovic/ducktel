@@ -219,12 +219,17 @@ func (h *Handlers) handleQueryMetric(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handlers) handleListTenants(w http.ResponseWriter, r *http.Request) {
+	// A key bound to specific tenants already says which ones it may see.
+	if rows, ok := telemetry.KeyTenants(httpauth.PrincipalFrom(r.Context())); ok {
+		writeRows(w, rows, []string{"tenant"})
+		return
+	}
 	rows, cols, err := h.core.ListTenants()
 	if err != nil {
 		writeErr(w, err)
 		return
 	}
-	writeRows(w, telemetry.FilterTenants(httpauth.PrincipalFrom(r.Context()), rows), cols)
+	writeRows(w, rows, cols)
 }
 
 func (h *Handlers) handleListServices(w http.ResponseWriter, r *http.Request) {

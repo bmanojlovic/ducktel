@@ -3,6 +3,7 @@ package telemetry
 import (
 	"errors"
 	"fmt"
+	"slices"
 
 	"github.com/davidgeorgehope/ducktel/internal/keys"
 )
@@ -44,26 +45,18 @@ func ResolveTenant(p *keys.Principal, requested string) (string, error) {
 	return requested, nil
 }
 
-// FilterTenants keeps only the ListTenants rows the principal may read, so a
-// key's dashboard picker never shows another tenant's name. A key bound to
-// one tenant always sees that tenant, even before it has sent any traces.
-func FilterTenants(p *keys.Principal, rows []map[string]any) []map[string]any {
+// KeyTenants returns the tenant list for a key bound to specific tenants,
+// straight from the key: there is nothing to discover, so no data is scanned,
+// and a tenant that has not sent anything yet is listed all the same. ok is
+// false for a shared token or a "*" key, which still need ListTenants to see
+// tenants that no key names (senders on the shared token, older data).
+func KeyTenants(p *keys.Principal) (rows []map[string]any, ok bool) {
 	if p == nil || p.AllTenants() {
-		return rows
+		return nil, false
 	}
-	out := make([]map[string]any, 0, len(p.Tenants))
-	seen := map[string]bool{}
-	for _, r := range rows {
-		t, _ := r["tenant"].(string)
-		if p.AllowsTenant(t) {
-			out = append(out, r)
-			seen[t] = true
-		}
+	rows = make([]map[string]any, 0, len(p.Tenants))
+	for _, t := range slices.Sorted(slices.Values(p.Tenants)) {
+		rows = append(rows, map[string]any{"tenant": t})
 	}
-	for _, t := range p.Tenants {
-		if !seen[t] {
-			out = append(out, map[string]any{"tenant": t})
-		}
-	}
-	return out
+	return rows, true
 }
