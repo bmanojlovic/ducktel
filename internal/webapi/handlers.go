@@ -14,6 +14,7 @@ import (
 	"strings"
 
 	"github.com/davidgeorgehope/ducktel/internal/httpauth"
+	"github.com/davidgeorgehope/ducktel/internal/keys"
 	"github.com/davidgeorgehope/ducktel/internal/telemetry"
 )
 
@@ -22,7 +23,12 @@ type Handlers struct {
 	core    *telemetry.Core
 	flusher *telemetry.Flusher
 	token   string
+	keys    *keys.Store
 }
+
+// SetKeys accepts per-client read keys alongside the shared token; a key only
+// reads the tenants it is bound to. Call before Register.
+func (h *Handlers) SetKeys(s *keys.Store) { h.keys = s }
 
 // NewHandlers builds the REST handlers. token, when non-empty, is required as
 // a bearer token on every route — the same read token the MCP server uses;
@@ -35,7 +41,7 @@ func NewHandlers(core *telemetry.Core, flusher *telemetry.Flusher, token string)
 // check as every other authenticated surface in ducktel.
 func (h *Handlers) Register(mux *http.ServeMux) {
 	auth := func(fn http.HandlerFunc) http.Handler {
-		return logRequests(httpauth.Bearer(h.token, fn))
+		return logRequests(httpauth.Authenticate(h.token, h.keys, keys.ScopeRead, noteKey(fn)))
 	}
 	mux.Handle("GET /api/traces", auth(h.handleSearchSpans))
 	mux.Handle("GET /api/traces/{trace_id}", auth(h.handleLookupTrace))
@@ -75,10 +81,24 @@ func writeRows(w http.ResponseWriter, rows []map[string]any, cols []string) {
 // failure, 500.
 func writeErr(w http.ResponseWriter, err error) {
 	status := http.StatusInternalServerError
-	if telemetry.IsInvalidInput(err) {
+	switch {
+	case telemetry.IsForbidden(err):
+		status = http.StatusForbidden
+	case telemetry.IsInvalidInput(err):
 		status = http.StatusBadRequest
 	}
 	http.Error(w, err.Error(), status)
+}
+
+// tenant resolves the request's ?tenant= against the caller's key (see
+// telemetry.ResolveTenant). On error it has already written the response.
+func tenant(w http.ResponseWriter, r *http.Request) (string, bool) {
+	t, err := telemetry.ResolveTenant(httpauth.PrincipalFrom(r.Context()), r.URL.Query().Get("tenant"))
+	if err != nil {
+		writeErr(w, err)
+		return "", false
+	}
+	return t, true
 }
 
 func queryInt(r *http.Request, name string, def int) int {
@@ -96,6 +116,10 @@ func queryInt(r *http.Request, name string, def int) int {
 // --- handlers ---
 
 func (h *Handlers) handleSearchSpans(w http.ResponseWriter, r *http.Request) {
+	tn, ok := tenant(w, r)
+	if !ok {
+		return
+	}
 	q := r.URL.Query()
 
 	// Filters arrive as repeated ?filter=key:value pairs.
@@ -110,7 +134,7 @@ func (h *Handlers) handleSearchSpans(w http.ResponseWriter, r *http.Request) {
 	}
 
 	rows, cols, err := h.core.SearchSpans(
-		q.Get("tenant"), q.Get("service_name"), filters,
+		tn, q.Get("service_name"), filters,
 		queryInt(r, "since_minutes", 0), queryInt(r, "limit", 0),
 	)
 	if err != nil {
@@ -121,6 +145,10 @@ func (h *Handlers) handleSearchSpans(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handlers) handleSearchLogs(w http.ResponseWriter, r *http.Request) {
+	tn, ok := tenant(w, r)
+	if !ok {
+		return
+	}
 	q := r.URL.Query()
 
 	// Same repeated ?filter=key:value pairs as the span search endpoint.
@@ -135,7 +163,7 @@ func (h *Handlers) handleSearchLogs(w http.ResponseWriter, r *http.Request) {
 	}
 
 	rows, cols, err := h.core.SearchLogs(
-		q.Get("tenant"), q.Get("trace_id"), q.Get("service_name"), q.Get("severity"), q.Get("search"), filters,
+		tn, q.Get("trace_id"), q.Get("service_name"), q.Get("severity"), q.Get("search"), filters,
 		queryInt(r, "since_minutes", 0), queryInt(r, "limit", 0),
 	)
 	if err != nil {
@@ -146,10 +174,13 @@ func (h *Handlers) handleSearchLogs(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handlers) handleLookupTrace(w http.ResponseWriter, r *http.Request) {
+	tn, ok := tenant(w, r)
+	if !ok {
+		return
+	}
 	traceID := r.PathValue("trace_id")
-	q := r.URL.Query()
 
-	rows, cols, err := h.core.LookupTrace(traceID, q.Get("tenant"), queryInt(r, "limit", 0))
+	rows, cols, err := h.core.LookupTrace(traceID, tn, queryInt(r, "limit", 0))
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -158,6 +189,10 @@ func (h *Handlers) handleLookupTrace(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handlers) handleQueryMetric(w http.ResponseWriter, r *http.Request) {
+	tn, ok := tenant(w, r)
+	if !ok {
+		return
+	}
 	q := r.URL.Query()
 
 	// Filters arrive as repeated ?filter=key:value pairs, same as the span
@@ -173,7 +208,7 @@ func (h *Handlers) handleQueryMetric(w http.ResponseWriter, r *http.Request) {
 	}
 
 	rows, cols, err := h.core.QueryMetric(
-		q.Get("tenant"), q.Get("metric_name"), q.Get("aggregation"),
+		tn, q.Get("metric_name"), q.Get("aggregation"),
 		queryInt(r, "since_minutes", 0), q.Get("group_by"), filters,
 	)
 	if err != nil {
@@ -189,10 +224,14 @@ func (h *Handlers) handleListTenants(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
-	writeRows(w, rows, cols)
+	writeRows(w, telemetry.FilterTenants(httpauth.PrincipalFrom(r.Context()), rows), cols)
 }
 
 func (h *Handlers) handleListServices(w http.ResponseWriter, r *http.Request) {
+	tn, ok := tenant(w, r)
+	if !ok {
+		return
+	}
 	q := r.URL.Query()
 
 	// ?source=logs lists services seen in the log signal instead of traces;
@@ -204,9 +243,9 @@ func (h *Handlers) handleListServices(w http.ResponseWriter, r *http.Request) {
 		err  error
 	)
 	if q.Get("source") == "logs" {
-		rows, cols, err = h.core.ListLogServices(q.Get("tenant"))
+		rows, cols, err = h.core.ListLogServices(tn)
 	} else {
-		rows, cols, err = h.core.ListServices(q.Get("tenant"))
+		rows, cols, err = h.core.ListServices(tn)
 	}
 	if err != nil {
 		writeErr(w, err)
@@ -216,7 +255,11 @@ func (h *Handlers) handleListServices(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handlers) handleListMetricNames(w http.ResponseWriter, r *http.Request) {
-	rows, cols, err := h.core.ListMetricNames(r.URL.Query().Get("tenant"))
+	tn, ok := tenant(w, r)
+	if !ok {
+		return
+	}
+	rows, cols, err := h.core.ListMetricNames(tn)
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -232,6 +275,10 @@ func (h *Handlers) handleFlush(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "flush is not configured", http.StatusNotFound)
 		return
 	}
+	if !httpauth.PrincipalFrom(r.Context()).Has(keys.ScopeFlush) {
+		http.Error(w, "this key has no flush scope", http.StatusForbidden)
+		return
+	}
 	if err := h.flusher.Flush(r.Context()); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -245,5 +292,7 @@ func (h *Handlers) handleFlush(w http.ResponseWriter, r *http.Request) {
 // when a flush endpoint is configured.
 func (h *Handlers) handleConfig(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]bool{"flush_enabled": h.flusher.Enabled()})
+	json.NewEncoder(w).Encode(map[string]bool{
+		"flush_enabled": h.flusher.Enabled() && httpauth.PrincipalFrom(r.Context()).Has(keys.ScopeFlush),
+	})
 }

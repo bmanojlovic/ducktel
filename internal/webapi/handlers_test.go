@@ -4,9 +4,12 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/davidgeorgehope/ducktel/internal/keys"
 	"github.com/davidgeorgehope/ducktel/internal/query"
 	"github.com/davidgeorgehope/ducktel/internal/telemetry"
 	"github.com/davidgeorgehope/ducktel/internal/writer"
@@ -28,11 +31,21 @@ func seedSpan(svc, tenant, traceID string) writer.TraceSpan {
 // by the given token (empty disables auth, matching httpauth.Bearer).
 func newTestMux(t *testing.T, token string) *http.ServeMux {
 	t.Helper()
-	return newTestMuxWithFlusher(t, token, telemetry.NewFlusher("", ""))
+	return newTestMuxWith(t, token, telemetry.NewFlusher("", ""), nil)
 }
 
 // newTestMuxWithFlusher is newTestMux with a caller-supplied Flusher.
 func newTestMuxWithFlusher(t *testing.T, token string, flusher *telemetry.Flusher) *http.ServeMux {
+	return newTestMuxWith(t, token, flusher, nil)
+}
+
+// newTestMuxWithKeys is newTestMux with per-client keys enabled as well.
+func newTestMuxWithKeys(t *testing.T, token string, store *keys.Store) *http.ServeMux {
+	return newTestMuxWith(t, token, telemetry.NewFlusher("", ""), store)
+}
+
+// newTestMuxWith builds the mux with a given Flusher and key store.
+func newTestMuxWith(t *testing.T, token string, flusher *telemetry.Flusher, store *keys.Store) *http.ServeMux {
 	t.Helper()
 	dir := t.TempDir()
 
@@ -73,7 +86,9 @@ func newTestMuxWithFlusher(t *testing.T, token string, flusher *telemetry.Flushe
 	t.Cleanup(func() { engine.Close() })
 
 	mux := http.NewServeMux()
-	NewHandlers(telemetry.NewCore(engine), flusher, token).Register(mux)
+	h := NewHandlers(telemetry.NewCore(engine), flusher, token)
+	h.SetKeys(store)
+	h.Register(mux)
 	return mux
 }
 
@@ -422,5 +437,100 @@ func TestFlushReceiverErrorIs500(t *testing.T) {
 	mux := newTestMuxWithFlusher(t, "", telemetry.NewFlusher(receiver.URL+"/flush", ""))
 	if rec := doReq(t, mux, "POST", "/api/flush", ""); rec.Code != http.StatusInternalServerError {
 		t.Errorf("status = %d, want 500 when the receiver rejects the flush", rec.Code)
+	}
+}
+
+// --- per-client keys ---
+
+func newKeyedMux(t *testing.T) *http.ServeMux {
+	t.Helper()
+	path := t.TempDir() + "/keys.json"
+	entries := []keys.Entry{
+		{Name: "acme-reader", SHA256: keys.Hash("acme-key"), Scopes: []string{keys.ScopeRead}, Tenants: []string{"acme"}},
+		{Name: "new-reader", SHA256: keys.Hash("new-key"), Scopes: []string{keys.ScopeRead}, Tenants: []string{"fresh"}},
+		{Name: "admin", SHA256: keys.Hash("admin-key"), Scopes: []string{keys.ScopeRead, keys.ScopeFlush}, Tenants: []string{"*"}},
+		{Name: "sender", SHA256: keys.Hash("ingest-key"), Scopes: []string{keys.ScopeIngest}, Tenants: []string{"acme"}},
+	}
+	data, _ := json.Marshal(entries)
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	store, err := keys.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return newTestMuxWithKeys(t, "shared", store)
+}
+
+func tenantsOf(t *testing.T, rec *httptest.ResponseRecorder) []string {
+	t.Helper()
+	var resp rowsResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("bad JSON: %v: %s", err, rec.Body.String())
+	}
+	var out []string
+	for _, r := range resp.Rows {
+		out = append(out, r["tenant"].(string))
+	}
+	return out
+}
+
+func TestKeyBoundToOneTenant(t *testing.T) {
+	mux := newKeyedMux(t)
+
+	// No tenant given: defaults to the key's own.
+	rec := doReq(t, mux, "GET", "/api/traces", "acme-key")
+	var resp rowsResponse
+	json.Unmarshal(rec.Body.Bytes(), &resp)
+	if rec.Code != http.StatusOK || len(resp.Rows) != 2 {
+		t.Fatalf("default tenant: status %d rows %d: %s", rec.Code, len(resp.Rows), rec.Body.String())
+	}
+
+	// Another tenant: 403, on every tenant-scoped route.
+	for _, path := range []string{
+		"/api/traces?tenant=globex", "/api/traces/trace-globex-1?tenant=globex",
+		"/api/logs?tenant=globex", "/api/metrics?tenant=globex&metric_name=cpu.util&aggregation=avg",
+		"/api/services?tenant=globex", "/api/metric-names?tenant=globex",
+	} {
+		if rec := doReq(t, mux, "GET", path, "acme-key"); rec.Code != http.StatusForbidden {
+			t.Errorf("%s: status %d, want 403", path, rec.Code)
+		}
+	}
+
+	// The picker only shows the key's tenant.
+	if got := tenantsOf(t, doReq(t, mux, "GET", "/api/tenants", "acme-key")); len(got) != 1 || got[0] != "acme" {
+		t.Errorf("tenants for acme key = %v", got)
+	}
+	// A tenant with no data yet still shows up for its own key.
+	if got := tenantsOf(t, doReq(t, mux, "GET", "/api/tenants", "new-key")); len(got) != 1 || got[0] != "fresh" {
+		t.Errorf("tenants for fresh key = %v", got)
+	}
+}
+
+func TestKeyScopesOnAPI(t *testing.T) {
+	mux := newKeyedMux(t)
+	if rec := doReq(t, mux, "GET", "/api/traces?tenant=acme", "ingest-key"); rec.Code != http.StatusUnauthorized {
+		t.Errorf("ingest key read the API: %d", rec.Code)
+	}
+	if got := tenantsOf(t, doReq(t, mux, "GET", "/api/tenants", "admin-key")); len(got) != 2 {
+		t.Errorf("* key tenants = %v, want both", got)
+	}
+	if rec := doReq(t, mux, "GET", "/api/traces?tenant=globex", "admin-key"); rec.Code != http.StatusOK {
+		t.Errorf("* key on globex: %d", rec.Code)
+	}
+	// Shared token: unchanged behaviour, tenant still required.
+	if rec := doReq(t, mux, "GET", "/api/traces", "shared"); rec.Code != http.StatusBadRequest {
+		t.Errorf("shared token without tenant: %d, want 400", rec.Code)
+	}
+	if got := tenantsOf(t, doReq(t, mux, "GET", "/api/tenants", "shared")); len(got) != 2 {
+		t.Errorf("shared token tenants = %v, want both", got)
+	}
+}
+
+func TestConfigHidesFlushWithoutScope(t *testing.T) {
+	mux := newKeyedMux(t)
+	rec := doReq(t, mux, "GET", "/api/config", "acme-key")
+	if !strings.Contains(rec.Body.String(), `"flush_enabled":false`) {
+		t.Errorf("config for read-only key: %s", rec.Body.String())
 	}
 }

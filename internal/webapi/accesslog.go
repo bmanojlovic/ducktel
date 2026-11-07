@@ -1,11 +1,14 @@
 package webapi
 
 import (
+	"context"
 	"log"
 	"net/http"
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/davidgeorgehope/ducktel/internal/httpauth"
 )
 
 // logRequests writes one line per /api request: method, path, the query
@@ -17,7 +20,8 @@ func logRequests(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 		rec := &recorder{ResponseWriter: w, status: http.StatusOK}
-		next.ServeHTTP(rec, r)
+		key := "-" // stays "-" when auth rejected the request
+		next.ServeHTTP(rec, r.WithContext(context.WithValue(r.Context(), keySlot{}, &key)))
 
 		q := r.URL.Query()
 		names := make([]string, 0, len(q))
@@ -25,11 +29,25 @@ func logRequests(next http.Handler) http.Handler {
 			names = append(names, k)
 		}
 		sort.Strings(names)
-		log.Printf("api: %s %s params=[%s] since_minutes=%s limit=%s status=%d bytes=%d dur=%s",
-			r.Method, r.URL.Path, strings.Join(names, ","),
+		log.Printf("api: %s %s key=%s params=[%s] since_minutes=%s limit=%s status=%d bytes=%d dur=%s",
+			r.Method, r.URL.Path, key, strings.Join(names, ","),
 			orDash(q.Get("since_minutes")), orDash(q.Get("limit")),
 			rec.status, rec.bytes, time.Since(start).Round(time.Millisecond))
 	})
+}
+
+// keySlot carries a pointer from logRequests (outside auth) to noteKey
+// (inside it), so the access line can name the key the request used.
+type keySlot struct{}
+
+// noteKey records the authenticated key's name for logRequests.
+func noteKey(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if slot, ok := r.Context().Value(keySlot{}).(*string); ok {
+			*slot = httpauth.PrincipalFrom(r.Context()).Name
+		}
+		next(w, r)
+	}
 }
 
 func orDash(s string) string {

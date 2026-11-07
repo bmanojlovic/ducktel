@@ -30,6 +30,7 @@ func serveCmd() *cobra.Command {
 		retention     string
 		token         string
 		flushToken    string
+		keysFile      string
 	)
 
 	cmd := &cobra.Command{
@@ -99,6 +100,11 @@ token would cross an untrusted network.`,
 				}
 			}
 
+			store, err := openKeys(cmd, keysFile)
+			if err != nil {
+				return err
+			}
+
 			// One writer per data directory: refuse to start rather than
 			// race another serve over the same files. Deferred, so it is
 			// released only after the final flush in w.Stop below.
@@ -118,8 +124,8 @@ token would cross an untrusted network.`,
 			w.Start()
 
 			authState := "disabled"
-			if token != "" {
-				authState = "enabled"
+			if token != "" || store != nil {
+				authState = fmt.Sprintf("enabled (keys=%d)", store.Len())
 			}
 			// Log the effective configuration once at startup: without it the
 			// log cannot be used to tell what a running instance was told to do.
@@ -131,6 +137,9 @@ token would cross an untrusted network.`,
 				dataDir, flushInterval, bufferSize, retentionState, authState)
 
 			r := receiver.New(host, port, w, token, flushToken, w.Flush)
+			if store != nil {
+				r.SetKeys(store)
+			}
 
 			sigCh := make(chan os.Signal, 1)
 			// SIGHUP requests an immediate flush without shutting down, so
@@ -181,6 +190,7 @@ token would cross an untrusted network.`,
 	cmd.Flags().IntVar(&bufferSize, "buffer-size", 1000, "Records per signal that force a flush ahead of --flush-interval")
 	cmd.Flags().StringVar(&retention, "retention", "", "Delete date partitions older than this window (e.g. 720h or 30d); empty keeps data forever")
 	cmd.Flags().StringVar(&token, "auth-token", "", "Require this bearer token on OTLP endpoints (env: DUCKTEL_AUTH_TOKEN)")
+	cmd.Flags().StringVar(&keysFile, "keys-file", "", keysFileHelp)
 	cmd.Flags().StringVar(&flushToken, "flush-token", "", "Require this bearer token on POST /flush (env: DUCKTEL_FLUSH_TOKEN, or DUCKTEL_MCP_TOKEN)")
 
 	return cmd
