@@ -28,6 +28,8 @@ type Server struct {
 	// principal maps a tool call's HTTP headers to the caller. nil (stdio, or
 	// no per-client keys) treats every call as the shared token.
 	principal func(http.Header) *keys.Principal
+	// dashboardURL, when set, adds a dashboard link to every result.
+	dashboardURL string
 }
 
 // SetPrincipalFunc enables per-client keys: each tool call is resolved to the
@@ -72,7 +74,8 @@ func (s *Server) Register(srv *sdkmcp.Server) {
 		Description: "Find spans matching attribute filters within a time range. " +
 			"Use this to locate spans by any attribute key/value pair — for example " +
 			"service.name, http.request.method, or any custom attribute. Returns matching " +
-			"spans with timing, status and attributes, capped at limit results.",
+			"spans with timing, status and attributes, capped at limit results. " +
+			"min_ms/max_ms keep spans by duration, e.g. the requests of one histogram bucket.",
 	}, s.spanSearch)
 
 	sdkmcp.AddTool(srv, &sdkmcp.Tool{
@@ -99,6 +102,10 @@ func (s *Server) Register(srv *sdkmcp.Server) {
 			"null above the last bound) and value (observations) — the last two for " +
 			"explicit-bucket histograms only; " +
 			"cumulative series are turned into increments within the window. " +
+			"aggregation=exemplars returns the concrete requests senders attached to " +
+			"the points (timestamp, value, trace_id, span_id), highest value first; " +
+			"narrow with min_value/max_value (e.g. one bucket) and follow a trace_id " +
+			"with trace_lookup and log_search. " +
 			"For gauge and sum points, count counts exported POINTS, not events: a " +
 			"gauge re-exported every interval is counted once per export, so use a " +
 			"counter or a histogram to count events.",
@@ -160,7 +167,7 @@ func (s *Server) traceLookup(ctx context.Context, req *sdkmcp.CallToolRequest, a
 	if err != nil {
 		return errResult(err.Error())
 	}
-	return rowsResult(rows, cols)
+	return withLink(rows, cols, s.traceLink(tenant, args.TraceID))
 }
 
 // --- span_search ---
@@ -176,6 +183,8 @@ type spanSearchArgs struct {
 	ServiceName  string       `json:"service_name,omitempty" jsonschema:"restrict to one service name"`
 	SinceMinutes int          `json:"since_minutes,omitempty" jsonschema:"how far back to search, in minutes. Default 60."`
 	Limit        int          `json:"limit,omitempty" jsonschema:"maximum spans to return, default 100. Cap 1000."`
+	MinMs        *float64     `json:"min_ms,omitempty" jsonschema:"only spans lasting at least this many milliseconds (inclusive)"`
+	MaxMs        *float64     `json:"max_ms,omitempty" jsonschema:"only spans lasting at most this many milliseconds (inclusive). With min_ms, e.g. one histogram bucket's bounds."`
 }
 
 func (s *Server) spanSearch(ctx context.Context, req *sdkmcp.CallToolRequest, args spanSearchArgs) (*sdkmcp.CallToolResult, any, error) {
@@ -188,11 +197,12 @@ func (s *Server) spanSearch(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 	if err != nil {
 		return errResult(err.Error())
 	}
-	rows, cols, err := s.core.SearchSpans(tenant, args.ServiceName, filters, args.SinceMinutes, args.Limit)
+	rows, cols, err := s.core.SearchSpansIn(tenant, args.ServiceName, filters, args.SinceMinutes, args.Limit,
+		telemetry.Range{Min: args.MinMs, Max: args.MaxMs})
 	if err != nil {
 		return errResult(err.Error())
 	}
-	return rowsResult(rows, cols)
+	return withLink(rows, cols, s.spanLink(tenant, args))
 }
 
 // --- log_search ---
@@ -222,7 +232,7 @@ func (s *Server) logSearch(ctx context.Context, req *sdkmcp.CallToolRequest, arg
 	if err != nil {
 		return errResult(err.Error())
 	}
-	return rowsResult(rows, cols)
+	return withLink(rows, cols, s.logLink(tenant, args))
 }
 
 // --- metric_query ---
@@ -230,10 +240,13 @@ func (s *Server) logSearch(ctx context.Context, req *sdkmcp.CallToolRequest, arg
 type metricQueryArgs struct {
 	Tenant       string       `json:"tenant,omitempty" jsonschema:"the tenant to query; only data for this tenant is returned. May be omitted when the key is bound to a single tenant."`
 	MetricName   string       `json:"metric_name" jsonschema:"the metric name to aggregate, e.g. process.cpu.utilization"`
-	Aggregation  string       `json:"aggregation" jsonschema:"one of: avg, sum, min, max, count, p50, p95, p99, buckets (histograms only)"`
+	Aggregation  string       `json:"aggregation" jsonschema:"one of: avg, sum, min, max, count, p50, p95, p99, buckets (histograms only), exemplars"`
 	SinceMinutes int          `json:"since_minutes,omitempty" jsonschema:"how far back to aggregate, in minutes. Default 60."`
 	GroupBy      string       `json:"group_by,omitempty" jsonschema:"optional comma-separated grouping keys: a column name (service_name, metric_type, ...) or a data-point attribute as attr.<key> / attributes.<key>, e.g. attr.kind groups by the metric point's attributes JSON key 'kind'. Result rows carry the key as their column name."`
 	Filters      []attrFilter `json:"filters,omitempty" jsonschema:"attribute key/value pairs to match, ANDed together; matched against data-point attributes OR resource attributes, same as span_search filters. Dotted keys are handled correctly."`
+	MinValue     *float64     `json:"min_value,omitempty" jsonschema:"exemplars only: keep exemplars whose value is at least this (inclusive)"`
+	MaxValue     *float64     `json:"max_value,omitempty" jsonschema:"exemplars only: keep exemplars whose value is at most this (inclusive); with min_value, e.g. one bucket's bounds"`
+	Limit        int          `json:"limit,omitempty" jsonschema:"exemplars only: maximum rows, default 20, cap 200"`
 }
 
 func (s *Server) metricQuery(ctx context.Context, req *sdkmcp.CallToolRequest, args metricQueryArgs) (*sdkmcp.CallToolResult, any, error) {
@@ -246,11 +259,12 @@ func (s *Server) metricQuery(ctx context.Context, req *sdkmcp.CallToolRequest, a
 	if err != nil {
 		return errResult(err.Error())
 	}
-	rows, cols, err := s.core.QueryMetric(tenant, args.MetricName, args.Aggregation, args.SinceMinutes, args.GroupBy, filters)
+	rows, cols, err := s.core.QueryMetricWith(tenant, args.MetricName, args.Aggregation, args.SinceMinutes, args.GroupBy, filters,
+		telemetry.MetricOpts{Value: telemetry.Range{Min: args.MinValue, Max: args.MaxValue}, Limit: args.Limit})
 	if err != nil {
 		return errResult(err.Error())
 	}
-	return rowsResult(rows, cols)
+	return withLink(rows, cols, s.metricLink(tenant, args))
 }
 
 // --- shared helpers ---
@@ -260,6 +274,15 @@ func errResult(msg string) (*sdkmcp.CallToolResult, any, error) {
 		IsError: true,
 		Content: []sdkmcp.Content{&sdkmcp.TextContent{Text: msg}},
 	}, nil, nil
+}
+
+// withLink is rowsResult plus the dashboard link, when links are on.
+func withLink(rows []map[string]any, cols []string, link string) (*sdkmcp.CallToolResult, any, error) {
+	res, _, err := rowsResult(rows, cols)
+	if err != nil {
+		return res, nil, err
+	}
+	return linked(res, link)
 }
 
 func rowsResult(rows []map[string]any, cols []string) (*sdkmcp.CallToolResult, any, error) {
