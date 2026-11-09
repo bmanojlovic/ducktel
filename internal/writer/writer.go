@@ -220,18 +220,16 @@ func requeue[T any](buf *[]T, records []T) (dropped int) {
 // full-column read. Adding zstd (SpeedFastest) at the same read speed took it
 // to 2.4 MB, and writing a whole day at that level costs about 0.1 s.
 //
-// DictionaryMaxBytes caps each column's dictionary at 1 MiB per row group.
-// Telemetry columns repeat heavily (service names, metric names, attribute
-// JSON), which is why dictionary encoding pays off, but a genuinely
-// high-cardinality column (a unique id, a per-row JSON blob) would otherwise
-// grow its dictionary for the whole row group and blow up the writer's
-// memory. Past 1 MiB that column falls back to PLAIN for the rest of the row
-// group, so the saving is kept where it exists and the cost stays bounded
-// where it does not.
+// No DictionaryMaxBytes. It was set to 1 MiB to bound the writer's memory on
+// a high-cardinality column, but in parquet-go v0.28.0 a column that passes
+// the cap and falls back to PLAIN is written with another column's values
+// from that row on: on real data, span attributes were replaced by resource
+// attributes in the late hours of a compacted day (TestMergeKeepsValues).
+// The dictionary is bounded anyway: per-flush files are small, and every
+// merge caps a row group at compactRowGroupRows.
 func writerOptions() []parquet.WriterOption {
 	return []parquet.WriterOption{
 		parquet.Compression(&zstd.Codec{Level: zstd.SpeedFastest}),
-		parquet.DictionaryMaxBytes(1 << 20),
 	}
 }
 
