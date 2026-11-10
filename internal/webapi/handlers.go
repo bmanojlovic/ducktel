@@ -182,7 +182,7 @@ func (h *Handlers) handleSearchSpans(w http.ResponseWriter, r *http.Request) {
 
 	rows, cols, err := h.core.SearchSpansIn(
 		tn, q.Get("service_name"), filters,
-		queryInt(r, "since_minutes", 0), queryInt(r, "limit", 0), dur,
+		queryInt(r, "since_minutes", 0), queryInt(r, "until_minutes", 0), queryInt(r, "limit", 0), dur,
 	)
 	if err != nil {
 		writeErr(w, err)
@@ -205,7 +205,7 @@ func (h *Handlers) handleSearchLogs(w http.ResponseWriter, r *http.Request) {
 
 	rows, cols, err := h.core.SearchLogs(
 		tn, q.Get("trace_id"), q.Get("service_name"), q.Get("severity"), q.Get("search"), filters,
-		queryInt(r, "since_minutes", 0), queryInt(r, "limit", 0),
+		queryInt(r, "since_minutes", 0), queryInt(r, "until_minutes", 0), queryInt(r, "limit", 0),
 	)
 	if err != nil {
 		writeErr(w, err)
@@ -268,6 +268,7 @@ func (h *Handlers) handleSlowRequests(w http.ResponseWriter, r *http.Request) {
 		SpanName:    q.Get("span_name"),
 		Filters:     filters,
 		Since:       queryInt(r, "since_minutes", 0),
+		Until:       queryInt(r, "until_minutes", 0),
 		Value:       val,
 		Limit:       queryInt(r, "limit", 0),
 	})
@@ -284,6 +285,7 @@ const metricParamsHelp = "metric_name and aggregation are required. Parameters: 
 	"metric_name (required; see /api/metric-names), " +
 	"aggregation (required: avg, sum, min, max, count, p50, p95, p99, exemplars; buckets for histograms), " +
 	"tenant, since_minutes (default 60), " +
+	"until_minutes (optional; where the window ends, default 0 = now, must be less than since_minutes), " +
 	"group_by (comma-separated columns, attr.<key> data-point attributes, or resource.<key> resource attributes), " +
 	"step (optional time series: 30s, 1m, 5m, 1h or whole seconds; adds a time column), " +
 	"filter=key:value (repeatable), " +
@@ -315,7 +317,7 @@ func (h *Handlers) handleQueryMetric(w http.ResponseWriter, r *http.Request) {
 	rows, cols, err := h.core.QueryMetricWith(
 		tn, q.Get("metric_name"), q.Get("aggregation"),
 		queryInt(r, "since_minutes", 0), q.Get("group_by"), filters,
-		telemetry.MetricOpts{Value: val, Limit: queryInt(r, "limit", 0), Step: q.Get("step")},
+		telemetry.MetricOpts{Value: val, Limit: queryInt(r, "limit", 0), Step: q.Get("step"), Until: queryInt(r, "until_minutes", 0)},
 	)
 	if err != nil {
 		writeErr(w, err)
