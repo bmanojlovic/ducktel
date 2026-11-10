@@ -92,6 +92,19 @@ func TestKeyTenantEnforcedOnTools(t *testing.T) {
 	if !isErr {
 		t.Errorf("trace_lookup on foreign tenant succeeded: %s", body)
 	}
+	// Every tenant-scoped tool must refuse a foreign tenant, so a new tool that
+	// reads args.Tenant directly instead of resolving it fails here.
+	for tool, args := range map[string]map[string]any{
+		"span_search":   {"tenant": "globex"},
+		"log_search":    {"tenant": "globex"},
+		"metric_query":  {"tenant": "globex", "metric_name": "m", "aggregation": "avg"},
+		"slow_requests": {"tenant": "globex"},
+		"compare_spans": {"tenant": "globex"},
+	} {
+		if body, isErr := call(t, s, tool, args); !isErr || !strings.Contains(body, "not allowed") {
+			t.Errorf("%s on foreign tenant: err=%v body=%s", tool, isErr, body)
+		}
+	}
 	// No flush scope.
 	body, isErr = call(t, s, "flush_buffer", map[string]any{})
 	if !isErr || !strings.Contains(body, "flush scope") {
