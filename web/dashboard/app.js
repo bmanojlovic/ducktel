@@ -1010,7 +1010,7 @@ export async function renderDistributionInto(target, label, filters, baseParams,
     const selected = opts.selectedFn && opts.selectedFn(lo, le) ? " selected" : "";
     return `
       <div class="bar-row clickable${selected}" data-i="${i}" title="click for the requests in this bucket">
-        <div class="bar-label">${escapeHtml(name)}</div>
+        <div class="bar-label">${name}</div>
         <div class="bar-track"><div class="bar-fill dist" style="width:${(v / max) * 100}%"></div></div>
         <div class="bar-value">${fmtValue(v)}</div>
         <div class="bar-marks">${marks}</div>
@@ -1057,7 +1057,7 @@ async function showBucketRequests(lo, le, filters, baseParams, unit) {
   if (!current("bucket", t)) return;
   rows = rows || [];
   const range = `${lo === null ? "" : fmtValue(lo, unit)} – ${le === null ? "∞" : fmtValue(le, unit)}`;
-  box.innerHTML = `<div class="dist-head"><b>requests ${escapeHtml(range)}</b> ·
+  box.innerHTML = `<div class="dist-head"><b>requests ${range}</b> ·
     ${rows.length} request${rows.length === 1 ? "" : "s"}</div>`;
 
   // Same bounds as a span duration filter, when the unit converts to ms.
@@ -1176,11 +1176,13 @@ function val(resp) {
   return r && r.value !== null && r.value !== undefined ? Number(r.value) : null;
 }
 
+// fmtValue returns HTML: metric_unit comes from whatever the sender reported,
+// so it is escaped here, and callers put the result into markup as is.
 export function fmtValue(v, unit) {
   if (v === null || v === undefined) return "—";
   const n = Number(v);
   const s = Number.isInteger(n) ? String(n) : n.toFixed(3);
-  return unit ? `${s} ${unit}` : s;
+  return unit ? `${s} ${escapeHtml(unit)}` : s;
 }
 
 // --- flush ---
