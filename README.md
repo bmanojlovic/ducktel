@@ -196,6 +196,31 @@ export OTEL_EXPORTER_OTLP_HEADERS="Authorization=Bearer $DUCKTEL_AUTH_TOKEN"
 
 `POST /flush` takes a **separate** token (`--flush-token` / `DUCKTEL_FLUSH_TOKEN`, falling back to `DUCKTEL_MCP_TOKEN`): it's a control action requested by the query side, not a data-ingest action, so the process that queries can trigger a flush without ever holding the write token. If the token would cross an untrusted network, put a TLS-terminating proxy in front — ducktel does not terminate TLS itself.
 
+#### Per-client keys (the tenant comes from the key)
+
+Instead of, or next to, the shared tokens, `serve` and `mcp` accept a keys file (`--keys-file` / `DUCKTEL_KEYS_FILE`). It holds only SHA-256 hashes, so it is not a secret and can live in a ConfigMap or in git:
+
+```json
+[
+  {"name": "shop-otel",   "sha256": "<hex>", "scopes": ["ingest"],         "tenants": ["shop"]},
+  {"name": "shop-agent",  "sha256": "<hex>", "scopes": ["read"],           "tenants": ["shop"]},
+  {"name": "ops",         "sha256": "<hex>", "scopes": ["read", "flush"],  "tenants": ["*"]}
+]
+```
+
+- **ingest** key bound to one tenant: ducktel sets `tenant.id` on everything it sends, replacing whatever the sender put there. Senders only configure the header and never deal with tenants.
+- **read** key: MCP tools and `/api/*` only answer for the key's tenants (403 otherwise); with one tenant, the `tenant` argument may be omitted. The dashboard's tenant picker lists only those tenants.
+- **flush** scope allows `POST /flush` on the receiver and the flush button / `flush_buffer` tool.
+
+The file is re-read when it changes (checked every 30s), so adding or revoking a key needs no restart; a broken edit keeps the previous list. The shared tokens keep working unchanged.
+
+Create a key where it will be used, so the token never travels:
+
+```bash
+ducktel key new --name shop-agent --out ~/.config/ducktel/shop-agent.token
+# {"name":"shop-agent","sha256":"…","token_file":"…"}   <- only the hash is printed
+```
+
 ### `ducktel query`
 
 Run arbitrary SQL against traces, logs, or metrics.

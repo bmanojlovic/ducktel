@@ -4,9 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
 
 	sdkmcp "github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"github.com/davidgeorgehope/ducktel/internal/keys"
 	"github.com/davidgeorgehope/ducktel/internal/query"
 	"github.com/davidgeorgehope/ducktel/internal/telemetry"
 )
@@ -24,8 +26,29 @@ import (
 type Server struct {
 	core    *telemetry.Core
 	flusher *telemetry.Flusher
+	// principal maps a tool call's HTTP headers to the caller. nil (stdio, or
+	// no per-client keys) treats every call as the shared token.
+	principal func(http.Header) *keys.Principal
 	// dashboardURL, when set, adds a dashboard link to every result.
 	dashboardURL string
+}
+
+// SetPrincipalFunc enables per-client keys: each tool call is resolved to the
+// key that sent it, and its tenant binding is enforced. The HTTP layer has
+// already rejected unknown tokens, so f only has to tell keys apart.
+func (s *Server) SetPrincipalFunc(f func(http.Header) *keys.Principal) { s.principal = f }
+
+// caller returns the principal of one tool call.
+func (s *Server) caller(req *sdkmcp.CallToolRequest) *keys.Principal {
+	if s.principal == nil || req == nil || req.Extra == nil {
+		return keys.LegacyPrincipal
+	}
+	return s.principal(req.Extra.Header)
+}
+
+// tenant resolves a tool call's tenant argument against the caller's key.
+func (s *Server) tenant(req *sdkmcp.CallToolRequest, requested string) (string, error) {
+	return telemetry.ResolveTenant(s.caller(req), requested)
 }
 
 // NewServer wires the query engine into an MCP server. An empty flushURL
@@ -138,6 +161,9 @@ type flushArgs struct{}
 // query side is allowed to request a flush but must never be able to write
 // telemetry, so the two secrets stay separate.
 func (s *Server) flushBuffer(ctx context.Context, req *sdkmcp.CallToolRequest, args flushArgs) (*sdkmcp.CallToolResult, any, error) {
+	if !s.caller(req).Has(keys.ScopeFlush) {
+		return errResult("this key has no flush scope")
+	}
 	if err := s.flusher.Flush(ctx); err != nil {
 		return errResult(err.Error())
 	}
@@ -153,13 +179,17 @@ func (s *Server) flushBuffer(ctx context.Context, req *sdkmcp.CallToolRequest, a
 
 type traceLookupArgs struct {
 	TraceID string `json:"trace_id" jsonschema:"the trace id to retrieve, as 32 lowercase hex characters"`
-	Tenant  string `json:"tenant" jsonschema:"the tenant this trace belongs to; only data for this tenant is returned"`
+	Tenant  string `json:"tenant,omitempty" jsonschema:"the tenant this trace belongs to; only data for this tenant is returned. May be omitted when the key is bound to a single tenant."`
 	Detail  string `json:"detail,omitempty" jsonschema:"summary (default) returns a compact aggregated summary; spans returns every span with attributes, ordered by start time, which can be large"`
 	Limit   int    `json:"limit,omitempty" jsonschema:"maximum spans to return for detail=spans; default 1000"`
 }
 
 func (s *Server) traceLookup(ctx context.Context, req *sdkmcp.CallToolRequest, args traceLookupArgs) (*sdkmcp.CallToolResult, any, error) {
-	tenant := args.Tenant
+	tenant, err := s.tenant(req, args.Tenant)
+	if err != nil {
+		return errResult(err.Error())
+	}
+
 	switch args.Detail {
 	case "", "summary":
 		summary, err := s.core.SummarizeTrace(args.TraceID, tenant)
@@ -187,7 +217,7 @@ type attrFilter struct {
 }
 
 type spanSearchArgs struct {
-	Tenant       string       `json:"tenant" jsonschema:"the tenant to query; only data for this tenant is returned"`
+	Tenant       string       `json:"tenant,omitempty" jsonschema:"the tenant to query; only data for this tenant is returned. May be omitted when the key is bound to a single tenant."`
 	Filters      []attrFilter `json:"filters,omitempty" jsonschema:"attribute key/value pairs to match (ANDed together); span_name, status_code and span_kind match the span's own fields, e.g. {\"key\":\"span_name\",\"value\":\"POST /mcp\",\"op\":\"!=\"}. Omit to match all spans in the time range."`
 	ServiceName  string       `json:"service_name,omitempty" jsonschema:"restrict to one service name"`
 	SinceMinutes int          `json:"since_minutes,omitempty" jsonschema:"how far back to search, in minutes. Default 60."`
@@ -203,7 +233,10 @@ func (s *Server) spanSearch(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 		filters[i] = telemetry.AttrFilter{Key: f.Key, Value: f.Value, Op: f.Op}
 	}
 
-	tenant := args.Tenant
+	tenant, err := s.tenant(req, args.Tenant)
+	if err != nil {
+		return errResult(err.Error())
+	}
 	rows, cols, err := s.core.SearchSpansIn(tenant, args.ServiceName, filters, args.SinceMinutes, args.UntilMinutes, args.Limit,
 		telemetry.Range{Min: args.MinMs, Max: args.MaxMs})
 	if err != nil {
@@ -233,7 +266,10 @@ func (s *Server) compareSpans(ctx context.Context, req *sdkmcp.CallToolRequest, 
 		filters[i] = telemetry.AttrFilter{Key: f.Key, Value: f.Value, Op: f.Op}
 	}
 
-	tenant := args.Tenant
+	tenant, err := s.tenant(req, args.Tenant)
+	if err != nil {
+		return errResult(err.Error())
+	}
 	cmp, err := s.core.CompareSpans(tenant, telemetry.CompareOpts{
 		ServiceName: args.ServiceName,
 		SpanName:    args.SpanName,
@@ -253,7 +289,7 @@ func (s *Server) compareSpans(ctx context.Context, req *sdkmcp.CallToolRequest, 
 // --- log_search ---
 
 type logSearchArgs struct {
-	Tenant       string       `json:"tenant" jsonschema:"the tenant to query; only data for this tenant is returned"`
+	Tenant       string       `json:"tenant,omitempty" jsonschema:"the tenant to query; only data for this tenant is returned. May be omitted when the key is bound to a single tenant."`
 	TraceID      string       `json:"trace_id,omitempty" jsonschema:"restrict to the records of one trace id. A trace id is a precise key, so this searches the whole history unless since_minutes is given."`
 	ServiceName  string       `json:"service_name,omitempty" jsonschema:"restrict to one service name"`
 	Severity     string       `json:"severity,omitempty" jsonschema:"exact severity to match, case-insensitive: DEBUG, INFO, WARN, ERROR, FATAL. Matches the severity text senders set."`
@@ -270,17 +306,21 @@ func (s *Server) logSearch(ctx context.Context, req *sdkmcp.CallToolRequest, arg
 		filters[i] = telemetry.AttrFilter{Key: f.Key, Value: f.Value, Op: f.Op}
 	}
 
-	rows, cols, err := s.core.SearchLogs(args.Tenant, args.TraceID, args.ServiceName, args.Severity, args.Search, filters, args.SinceMinutes, args.UntilMinutes, args.Limit)
+	tenant, err := s.tenant(req, args.Tenant)
 	if err != nil {
 		return errResult(err.Error())
 	}
-	return withLink(rows, cols, s.logLink(args.Tenant, args))
+	rows, cols, err := s.core.SearchLogs(tenant, args.TraceID, args.ServiceName, args.Severity, args.Search, filters, args.SinceMinutes, args.UntilMinutes, args.Limit)
+	if err != nil {
+		return errResult(err.Error())
+	}
+	return withLink(rows, cols, s.logLink(tenant, args))
 }
 
 // --- slow_requests ---
 
 type slowRequestsArgs struct {
-	Tenant       string       `json:"tenant" jsonschema:"the tenant to query; only data for this tenant is returned"`
+	Tenant       string       `json:"tenant,omitempty" jsonschema:"the tenant to query; only data for this tenant is returned. May be omitted when the key is bound to a single tenant."`
 	MetricName   string       `json:"metric_name,omitempty" jsonschema:"when set, follow this metric's exemplars. Omit to use the slowest root spans instead."`
 	ServiceName  string       `json:"service_name,omitempty" jsonschema:"restrict to one service name"`
 	SpanName     string       `json:"span_name,omitempty" jsonschema:"spans source only: exact span_name to match"`
@@ -298,7 +338,10 @@ func (s *Server) slowRequests(ctx context.Context, req *sdkmcp.CallToolRequest, 
 		filters[i] = telemetry.AttrFilter{Key: f.Key, Value: f.Value, Op: f.Op}
 	}
 
-	tenant := args.Tenant
+	tenant, err := s.tenant(req, args.Tenant)
+	if err != nil {
+		return errResult(err.Error())
+	}
 	rows, err := s.core.SlowRequests(tenant, telemetry.SlowOpts{
 		MetricName:  args.MetricName,
 		ServiceName: args.ServiceName,
@@ -318,7 +361,7 @@ func (s *Server) slowRequests(ctx context.Context, req *sdkmcp.CallToolRequest, 
 // --- metric_query ---
 
 type metricQueryArgs struct {
-	Tenant       string       `json:"tenant" jsonschema:"the tenant to query; only data for this tenant is returned"`
+	Tenant       string       `json:"tenant,omitempty" jsonschema:"the tenant to query; only data for this tenant is returned. May be omitted when the key is bound to a single tenant."`
 	MetricName   string       `json:"metric_name" jsonschema:"the metric name to aggregate, e.g. process.cpu.utilization"`
 	Aggregation  string       `json:"aggregation" jsonschema:"one of: avg, sum, min, max, count, p50, p95, p99, buckets (histograms only), exemplars"`
 	SinceMinutes int          `json:"since_minutes,omitempty" jsonschema:"how far back to aggregate, in minutes. Default 60."`
@@ -337,7 +380,10 @@ func (s *Server) metricQuery(ctx context.Context, req *sdkmcp.CallToolRequest, a
 		filters[i] = telemetry.AttrFilter{Key: f.Key, Value: f.Value, Op: f.Op}
 	}
 
-	tenant := args.Tenant
+	tenant, err := s.tenant(req, args.Tenant)
+	if err != nil {
+		return errResult(err.Error())
+	}
 	rows, cols, err := s.core.QueryMetricWith(tenant, args.MetricName, args.Aggregation, args.SinceMinutes, args.GroupBy, filters,
 		telemetry.MetricOpts{Value: telemetry.Range{Min: args.MinValue, Max: args.MaxValue}, Limit: args.Limit, Step: args.Step, Until: args.UntilMinutes})
 	if err != nil {
