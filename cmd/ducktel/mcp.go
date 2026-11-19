@@ -15,6 +15,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/davidgeorgehope/ducktel/internal/httpauth"
+	"github.com/davidgeorgehope/ducktel/internal/keys"
 	"github.com/davidgeorgehope/ducktel/internal/mcp"
 	"github.com/davidgeorgehope/ducktel/internal/query"
 	"github.com/davidgeorgehope/ducktel/internal/telemetry"
@@ -31,6 +32,7 @@ func mcpCmd() *cobra.Command {
 		basePath  string
 		flushURL  string
 		dashboard bool
+		keysFile  string
 		dashURL   string
 	)
 
@@ -94,6 +96,11 @@ Examples:
 				}
 			}
 
+			store, err := openKeys(cmd, keysFile)
+			if err != nil {
+				return err
+			}
+
 			engine, err := query.Open(dataDir)
 			if err != nil {
 				return fmt.Errorf("opening query engine: %w", err)
@@ -108,6 +115,9 @@ Examples:
 				// The flush request is authorised with this server's own token.
 				s := mcp.NewServer(engine, flushURL, token)
 				s.SetDashboardURL(dashURL)
+				if store != nil {
+					s.SetPrincipalFunc(principalFromHeader(token, store))
+				}
 				s.Register(srv)
 				return srv
 			}
@@ -123,7 +133,7 @@ Examples:
 				}
 				return nil
 			}
-			return serveMCPHTTP(newServer, engine, host, port, token, basePath, flushURL, dashboard)
+			return serveMCPHTTP(newServer, engine, host, port, token, store, basePath, flushURL, dashboard)
 		},
 	}
 
@@ -133,6 +143,7 @@ Examples:
 	cmd.Flags().StringVar(&token, "auth-token", "", "Require this bearer token in HTTP mode (env: DUCKTEL_MCP_TOKEN)")
 	cmd.Flags().StringVar(&basePath, "base-path", "/mcp", "URL path to serve the MCP endpoint on in HTTP mode")
 	cmd.Flags().StringVar(&flushURL, "flush-url", "", "Writer's POST /flush endpoint, e.g. http://localhost:4318/flush; enables the flush_buffer tool (env: DUCKTEL_FLUSH_URL)")
+	cmd.Flags().StringVar(&keysFile, "keys-file", "", keysFileHelp)
 	cmd.Flags().StringVar(&dashURL, "dashboard-url", "", "Public address of the dashboard, e.g. https://otel.example.com/dashboard/; every tool result then carries a dashboard_url that opens the same query (env: DUCKTEL_DASHBOARD_URL)")
 	cmd.Flags().BoolVar(&dashboard, "dashboard", false, "Also serve the dashboard SPA at /dashboard and its REST API at /api, guarded by the same --auth-token")
 
@@ -149,15 +160,16 @@ func serveMCPHTTP(
 	host string,
 	port int,
 	token string,
+	store *keys.Store,
 	basePath string,
 	flushURL string,
 	dashboard bool,
 ) error {
-	if token == "" {
+	if token == "" && store == nil {
 		// Refuse rather than silently expose everything: over the network this
 		// endpoint reads every tenant, and an unauthenticated bind is almost
 		// certainly a misconfiguration rather than an intent.
-		return errors.New("--http requires --auth-token (or DUCKTEL_MCP_TOKEN): " +
+		return errors.New("--http requires --auth-token (or DUCKTEL_MCP_TOKEN) or --keys-file: " +
 			"an unauthenticated MCP endpoint exposes all tenant data")
 	}
 
@@ -165,7 +177,7 @@ func serveMCPHTTP(
 		func(*http.Request) *sdkmcp.Server { return newServer() }, nil)
 
 	mux := http.NewServeMux()
-	mux.Handle(basePath, httpauth.Bearer(token, handler))
+	mux.Handle(basePath, httpauth.Authenticate(token, store, keys.ScopeRead, handler))
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.Write([]byte(`{"status":"ok"}`))
@@ -177,7 +189,9 @@ func serveMCPHTTP(
 		// query logic, not a second trust domain.
 		core := telemetry.NewCore(engine)
 		flusher := telemetry.NewFlusher(flushURL, token)
-		webapi.NewHandlers(core, flusher, token).Register(mux)
+		api := webapi.NewHandlers(core, flusher, token)
+		api.SetKeys(store)
+		api.Register(mux)
 
 		// Static assets are unauthenticated: they're app shell with no data
 		// or secrets embedded in them. Only the /api/* calls the SPA makes
@@ -199,7 +213,7 @@ func serveMCPHTTP(
 		IdleTimeout:       120 * time.Second,
 	}
 
-	log.Printf("mcp: listening on %s%s (auth enabled, dashboard=%v)", addr, basePath, dashboard)
+	log.Printf("mcp: listening on %s%s (auth enabled, keys=%d, dashboard=%v)", addr, basePath, store.Len(), dashboard)
 
 	errCh := make(chan error, 1)
 	go func() { errCh <- srv.ListenAndServe() }()

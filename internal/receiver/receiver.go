@@ -14,9 +14,11 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/davidgeorgehope/ducktel/internal/httpauth"
+	"github.com/davidgeorgehope/ducktel/internal/keys"
 
 	collectlogsv1 "go.opentelemetry.io/proto/otlp/collector/logs/v1"
 	collectmetricsv1 "go.opentelemetry.io/proto/otlp/collector/metrics/v1"
@@ -60,7 +62,16 @@ type Receiver struct {
 	flushToken string
 	// flush makes buffered records durable on demand.
 	flush func() error
+	// keys, when set, are per-client keys accepted alongside the shared
+	// tokens; an ingest key bound to one tenant stamps it (see stampTenant).
+	keys *keys.Store
+	// overwrites remembers which (key, sender tenant) pairs were already
+	// logged, so a misconfigured sender is reported once, not per batch.
+	overwrites sync.Map
 }
+
+// SetKeys enables per-client keys. Call before Start.
+func (r *Receiver) SetKeys(s *keys.Store) { r.keys = s }
 
 // New creates a receiver bound to host:port. Pass an empty host to listen on
 // all interfaces; the serve command passes "localhost" by default so a local
@@ -80,11 +91,12 @@ func New(host string, port int, consumer Consumer, token, flushToken string, flu
 
 	mux := http.NewServeMux()
 	// OTLP ingest is authenticated when a token is configured.
-	mux.Handle("POST /v1/traces", r.authenticate(http.HandlerFunc(r.handleTraces)))
-	mux.Handle("POST /v1/logs", r.authenticate(http.HandlerFunc(r.handleLogs)))
-	mux.Handle("POST /v1/metrics", r.authenticate(http.HandlerFunc(r.handleMetrics)))
-	// Flush is a control action, authorised by its own token.
-	mux.Handle("POST /flush", httpauth.Bearer(flushToken, http.HandlerFunc(r.handleFlush)))
+	mux.Handle("POST /v1/traces", r.authenticate(r.token, keys.ScopeIngest, http.HandlerFunc(r.handleTraces)))
+	mux.Handle("POST /v1/logs", r.authenticate(r.token, keys.ScopeIngest, http.HandlerFunc(r.handleLogs)))
+	mux.Handle("POST /v1/metrics", r.authenticate(r.token, keys.ScopeIngest, http.HandlerFunc(r.handleMetrics)))
+	// Flush is a control action, authorised by its own token (or a key with
+	// the flush scope).
+	mux.Handle("POST /flush", r.authenticate(flushToken, keys.ScopeFlush, http.HandlerFunc(r.handleFlush)))
 	// Health stays unauthenticated so liveness/readiness probes keep working.
 	mux.HandleFunc("GET /health", r.handleHealth)
 
@@ -99,11 +111,14 @@ func New(host string, port int, consumer Consumer, token, flushToken string, flu
 	return r
 }
 
-// authenticate wraps a handler with the shared bearer-token check. It is a
-// no-op when no token is configured, and fails closed (401) when one is
-// configured but the request does not present it.
-func (r *Receiver) authenticate(next http.Handler) http.Handler {
-	return httpauth.Bearer(r.token, next)
+// authenticate wraps a handler with the shared bearer-token check, plus the
+// per-client keys when SetKeys was called. It is a no-op when neither is
+// configured, and fails closed (401) otherwise. The key store is read per
+// request, so SetKeys may be called after New.
+func (r *Receiver) authenticate(token, scope string, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		httpauth.Authenticate(token, r.keys, scope, next).ServeHTTP(w, req)
+	})
 }
 
 // handleFlush makes buffered records durable on demand, so the query side can
@@ -131,7 +146,7 @@ func (r *Receiver) handleFlush(w http.ResponseWriter, req *http.Request) {
 
 func (r *Receiver) Start() error {
 	log.Printf("OTLP receiver listening on %s", r.server.Addr)
-	if r.token == "" {
+	if r.token == "" && r.keys == nil {
 		if host, _, err := net.SplitHostPort(r.server.Addr); err == nil && host != "localhost" && host != "127.0.0.1" {
 			log.Printf("warning: no auth token configured and bound to %s — "+
 				"any client that can reach this port can write telemetry", r.server.Addr)
@@ -162,11 +177,14 @@ func (r *Receiver) handleTraces(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
+	for _, rs := range exportReq.GetResourceSpans() {
+		rs.Resource = r.stampTenant(req, rs.GetResource())
+	}
 	spans := convertSpans(exportReq)
 	if len(spans) > 0 {
 		r.consumer.Add(spans)
-		log.Printf("ingest: traces accepted %d span(s) in %s",
-			len(spans), time.Since(started).Round(time.Millisecond))
+		log.Printf("ingest: traces accepted %d span(s) in %s key=%s",
+			len(spans), time.Since(started).Round(time.Millisecond), httpauth.PrincipalFrom(req.Context()).Name)
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -232,11 +250,14 @@ func (r *Receiver) handleLogs(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
+	for _, rl := range exportReq.GetResourceLogs() {
+		rl.Resource = r.stampTenant(req, rl.GetResource())
+	}
 	records := convertLogs(exportReq)
 	if len(records) > 0 {
 		r.consumer.AddLogs(records)
-		log.Printf("ingest: logs accepted %d record(s) in %s",
-			len(records), time.Since(started).Round(time.Millisecond))
+		log.Printf("ingest: logs accepted %d record(s) in %s key=%s",
+			len(records), time.Since(started).Round(time.Millisecond), httpauth.PrincipalFrom(req.Context()).Name)
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -293,11 +314,14 @@ func (r *Receiver) handleMetrics(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
+	for _, rm := range exportReq.GetResourceMetrics() {
+		rm.Resource = r.stampTenant(req, rm.GetResource())
+	}
 	points := convertMetrics(exportReq)
 	if len(points) > 0 {
 		r.consumer.AddMetrics(points)
-		log.Printf("ingest: metrics accepted %d point(s) in %s",
-			len(points), time.Since(started).Round(time.Millisecond))
+		log.Printf("ingest: metrics accepted %d point(s) in %s key=%s",
+			len(points), time.Since(started).Round(time.Millisecond), httpauth.PrincipalFrom(req.Context()).Name)
 	}
 
 	w.Header().Set("Content-Type", "application/json")

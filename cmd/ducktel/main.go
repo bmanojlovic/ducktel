@@ -38,6 +38,7 @@ func main() {
 	rootCmd.PersistentFlags().StringVar(&format, "format", "json", "Output format: json, table, csv")
 
 	rootCmd.AddCommand(serveCmd())
+	rootCmd.AddCommand(keyCmd())
 	rootCmd.AddCommand(queryCmd())
 	rootCmd.AddCommand(schemaCmd())
 	rootCmd.AddCommand(servicesCmd())
