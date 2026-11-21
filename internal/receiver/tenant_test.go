@@ -2,6 +2,7 @@ package receiver
 
 import (
 	"encoding/json"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -198,5 +199,26 @@ func TestMultiTenantKeyRejectsForeignTenant(t *testing.T) {
 	r, cons := newKeyedReceiver(t)
 	if code := post(t, r, "/v1/logs", "multi-key", logsBody("a")); code != http.StatusOK || len(cons.logs) != 1 {
 		t.Errorf("logs for an allowed tenant: status %d, %d stored", code, len(cons.logs))
+	}
+}
+
+// A sender on a shared token is logged once per (service, tenant), not per
+// batch, so the log lists who still has to move to a key.
+func TestSharedTokenSenderLoggedOnce(t *testing.T) {
+	var buf strings.Builder
+	log.SetOutput(&buf)
+	defer log.SetOutput(os.Stderr)
+	r, _ := newKeyedReceiver(t)
+	for i := 0; i < 3; i++ {
+		post(t, r, "/v1/traces", "shared", traceBody("acme"))
+	}
+	post(t, r, "/v1/traces", "shared", traceBody("globex"))
+	post(t, r, "/v1/traces", "bla-key", traceBody(""))
+	got := strings.Count(buf.String(), "shared token used by")
+	if got != 2 {
+		t.Fatalf("shared-token lines = %d, want 2 (acme once, globex once, key sender never):\n%s", got, buf.String())
+	}
+	if !strings.Contains(buf.String(), `service.name="svc" tenant.id="acme"`) {
+		t.Errorf("line does not name the sender: %s", buf.String())
 	}
 }

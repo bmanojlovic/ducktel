@@ -29,6 +29,10 @@ func (r *Receiver) stampTenant(req *http.Request, res *resourcev1.Resource) (*re
 	p := httpauth.PrincipalFrom(req.Context())
 	tenant, ok := p.SingleTenant()
 	if !ok {
+		if p.Legacy {
+			r.reportLegacy(res)
+			return res, nil
+		}
 		if p.AllTenants() {
 			return res, nil
 		}
@@ -73,6 +77,23 @@ func (r *Receiver) reportOverwrite(key, sent string) {
 		return
 	}
 	log.Printf("ingest: key=%s sent %s=%q; replaced with the key's tenant", key, TenantAttr, sent)
+}
+
+// reportLegacy logs once per (service.name, tenant.id) that a sender still
+// writes with a shared token, so the shared tokens can be retired once this
+// list stops growing and every sender listed has its own key.
+func (r *Receiver) reportLegacy(res *resourcev1.Resource) {
+	service := ""
+	for _, kv := range res.GetAttributes() {
+		if kv.GetKey() == "service.name" {
+			service = kv.GetValue().GetStringValue()
+		}
+	}
+	tenant := tenantOfResource(res)
+	if _, seen := r.overwrites.LoadOrStore("legacy\x00"+service+"\x00"+tenant, true); seen {
+		return
+	}
+	log.Printf("ingest: shared token used by service.name=%q %s=%q", service, TenantAttr, tenant)
 }
 
 func stringValue(s string) *commonv1.AnyValue {

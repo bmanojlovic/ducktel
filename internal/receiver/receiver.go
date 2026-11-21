@@ -65,8 +65,9 @@ type Receiver struct {
 	// keys, when set, are per-client keys accepted alongside the shared
 	// tokens; an ingest key bound to one tenant stamps it (see stampTenant).
 	keys *keys.Store
-	// overwrites remembers which (key, sender tenant) pairs were already
-	// logged, so a misconfigured sender is reported once, not per batch.
+	// overwrites remembers which (key, sender tenant) pairs and which
+	// shared-token senders were already logged, so each is reported once,
+	// not per batch.
 	overwrites sync.Map
 }
 
