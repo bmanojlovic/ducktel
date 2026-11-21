@@ -178,7 +178,12 @@ func (r *Receiver) handleTraces(w http.ResponseWriter, req *http.Request) {
 	}
 
 	for _, rs := range exportReq.GetResourceSpans() {
-		rs.Resource = r.stampTenant(req, rs.GetResource())
+		res, err := r.stampTenant(req, rs.GetResource())
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusForbidden)
+			return
+		}
+		rs.Resource = res
 	}
 	spans := convertSpans(exportReq)
 	if len(spans) > 0 {
@@ -251,7 +256,12 @@ func (r *Receiver) handleLogs(w http.ResponseWriter, req *http.Request) {
 	}
 
 	for _, rl := range exportReq.GetResourceLogs() {
-		rl.Resource = r.stampTenant(req, rl.GetResource())
+		res, err := r.stampTenant(req, rl.GetResource())
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusForbidden)
+			return
+		}
+		rl.Resource = res
 	}
 	records := convertLogs(exportReq)
 	if len(records) > 0 {
@@ -315,7 +325,12 @@ func (r *Receiver) handleMetrics(w http.ResponseWriter, req *http.Request) {
 	}
 
 	for _, rm := range exportReq.GetResourceMetrics() {
-		rm.Resource = r.stampTenant(req, rm.GetResource())
+		res, err := r.stampTenant(req, rm.GetResource())
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusForbidden)
+			return
+		}
+		rm.Resource = res
 	}
 	points := convertMetrics(exportReq)
 	if len(points) > 0 {

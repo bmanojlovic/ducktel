@@ -58,6 +58,7 @@ func newKeyedReceiver(t *testing.T) (*Receiver, *captureConsumer) {
 	r.SetKeys(keyStore(t,
 		keys.Entry{Name: "bla-otel", SHA256: keys.Hash("bla-key"), Scopes: []string{keys.ScopeIngest}, Tenants: []string{"bla"}},
 		keys.Entry{Name: "multi", SHA256: keys.Hash("multi-key"), Scopes: []string{keys.ScopeIngest}, Tenants: []string{"a", "b"}},
+		keys.Entry{Name: "all", SHA256: keys.Hash("all-key"), Scopes: []string{keys.ScopeIngest}, Tenants: []string{keys.AllTenants}},
 		keys.Entry{Name: "reader", SHA256: keys.Hash("read-key"), Scopes: []string{keys.ScopeRead}, Tenants: []string{"bla"}},
 		keys.Entry{Name: "flusher", SHA256: keys.Hash("flush-key"), Scopes: []string{keys.ScopeFlush}},
 	))
@@ -106,6 +107,7 @@ func TestIngestKeyStampsTenant(t *testing.T) {
 		{"key overrides a foreign tenant", "bla-key", "evil", "bla"},
 		{"shared token keeps sender's tenant", "shared", "acme", "acme"},
 		{"multi-tenant key keeps sender's tenant", "multi-key", "b", "b"},
+		{"all-tenants key keeps sender's tenant", "all-key", "zeta", "zeta"},
 	}
 	for _, c := range cases {
 		r, cons := newKeyedReceiver(t)
@@ -161,5 +163,40 @@ func TestIngestScopes(t *testing.T) {
 	}
 	if code := post(t, r, "/flush", "shared", ""); code != http.StatusUnauthorized {
 		t.Errorf("ingest token on /flush: %d (must stay a separate secret)", code)
+	}
+}
+
+// A key bound to several tenants writes only those: a resource with another
+// tenant.id, or none, rejects the whole request (403) and nothing is stored,
+// on every signal. Mixed batches are refused too, not partially accepted.
+func TestMultiTenantKeyRejectsForeignTenant(t *testing.T) {
+	logsBody := func(tenant string) string {
+		return `{"resourceLogs":[{"resource":` + resourceJSON(tenant) + `,"scopeLogs":[{"logRecords":[{"timeUnixNano":"1","body":{"stringValue":"hi"}}]}]}]}`
+	}
+	metricsBody := func(tenant string) string {
+		return `{"resourceMetrics":[{"resource":` + resourceJSON(tenant) + `,"scopeMetrics":[{"metrics":[{"name":"m","gauge":{"dataPoints":[{"timeUnixNano":"1","asDouble":1}]}}]}]}]}`
+	}
+	mixed := `{"resourceSpans":[` +
+		`{"resource":` + resourceJSON("a") + `,"scopeSpans":[{"spans":[{"traceId":"0102030405060708090a0b0c0d0e0f10","spanId":"0102030405060708","name":"op","startTimeUnixNano":"1","endTimeUnixNano":"2"}]}]},` +
+		`{"resource":` + resourceJSON("evil") + `,"scopeSpans":[{"spans":[{"traceId":"0102030405060708090a0b0c0d0e0f11","spanId":"0102030405060709","name":"op","startTimeUnixNano":"1","endTimeUnixNano":"2"}]}]}]}`
+	cases := []struct{ name, path, body string }{
+		{"traces, foreign tenant", "/v1/traces", traceBody("evil")},
+		{"traces, no tenant", "/v1/traces", traceBody("")},
+		{"traces, one good and one foreign resource", "/v1/traces", mixed},
+		{"logs, foreign tenant", "/v1/logs", logsBody("evil")},
+		{"metrics, foreign tenant", "/v1/metrics", metricsBody("evil")},
+	}
+	for _, c := range cases {
+		r, cons := newKeyedReceiver(t)
+		if code := post(t, r, c.path, "multi-key", c.body); code != http.StatusForbidden {
+			t.Errorf("%s: status %d, want 403", c.name, code)
+		}
+		if n := len(cons.spans) + len(cons.logs) + len(cons.metrics); n != 0 {
+			t.Errorf("%s: %d records stored, want 0", c.name, n)
+		}
+	}
+	r, cons := newKeyedReceiver(t)
+	if code := post(t, r, "/v1/logs", "multi-key", logsBody("a")); code != http.StatusOK || len(cons.logs) != 1 {
+		t.Errorf("logs for an allowed tenant: status %d, %d stored", code, len(cons.logs))
 	}
 }
